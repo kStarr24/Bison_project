@@ -1,0 +1,2877 @@
+---
+title: "Bison Differential Abundance"
+author: "Krista Starr"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+---
+
+# Methods
+
+I am analyzing differentially abundant ASV's in the Bison project using the package `DESeq2`. I decided to use this method after talking with Allison. The code is modeled after an example from Allison and two DESeq2 tutorials online:
+
+- [DESeq2 tutorial](https://lashlock.github.io/compbio/R_presentation.html)
+- [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+For information on the technical details of DESeq2 try: 
+
+- [DESeq2 Basics Explained | Differential Gene Expression Analysis | Bioinformatics 101](https://www.youtube.com/watch?v=0b24mpzM_5M)
+- Enter `vignette("DESeq2")` in R to see detailed information updated by the package creators.
+- [Discussion on DESeq2 theory](https://uclouvain-cbio.github.io/WSBIM2122/sec-rnaseq.html)
+- [Discussion of manual calculation of geometric means](https://github.com/joey711/phyloseq/issues/445)
+
+Resource for using the `pheatmap` package:  
+
+-[Dave Tang's Blog](https://davetang.org/muse/2018/05/15/making-a-heatmap-in-r-with-the-pheatmap-package/)
+
+# Setting Up
+
+Load in libraries.
+
+```{r message=FALSE}
+library("genefilter")
+library("phyloseq")
+library("BiocManager")
+library("import")
+library("knitr")
+library("BiocStyle")
+library("ggplot2")
+library("gridExtra")
+library("dada2")
+library("DECIPHER")
+library("ape")
+library("phangorn")
+library("BiocStyle")
+library("ShortRead")
+library("dplyr")
+library("DESeq2")
+library("NCmisc")
+library("pheatmap")
+```
+
+
+Load in Phyloseq Objects.
+```{r}
+load("E:\\Bison Project\\Bison_analysis_attempt_3\\ps_final_analyze.rds")
+load("E:\\Bison Project\\Bison_analysis_attempt_3\\norm_mock.rds")
+```
+
+Load in metadata file
+```{r}
+Bison_meta = read.csv("E:\\Bison Project\\Bison_analysis_attempt_3\\bison_metadata_analysis.csv")
+```
+
+Set your alpha level
+```{r}
+alpha = 0.05
+```
+
+## Function creation
+
+Create geometric mean function  
+
+The geometric mean of a set of n numbers is the nth root of the product of all the numbers. By definition this means that any data set with one zero in it will have a geometric mean of zero. This is unfavorable because in the bison data almost all ASVs have atleast one zero count for a sample. To deal with this I use a modified version of geometric mean that ignores the zeros in multiplication but includes them in the total of n.
+```{r}
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+
+}
+```
+
+Function to create phylseq subsets
+```{r DESeq2_analysis_settings}
+
+# create a function to subset a phyloseq to keep only samples from two levels of a categorical variable. Prune ASVs that are not present in these groups.
+subset_ps_2_groups = function(ps, variable, g1, g2){
+  data = prune_samples((ps@sam_data[[variable]] == g1 | ps@sam_data[[variable]] == g2), ps)
+  data = prune_taxa(taxa_sums(data) > 0, data)
+  return(data)
+}
+```
+
+Function to do the DeSeq2 assessment in a pairwise manner
+```{r}
+# Function to do the DeSeq2 assesment in a pairwise manner
+
+# phyloseq = a phyloseq containing only the two sample groups you want to compare
+# vari = the variable that separates the two groups as it is refereed to in the phyloseq sample metadata
+# ref = the reference group of the comparison
+# g2 = the group being compared to the reference group
+# alpha = the alpha cutoff for considering a result statistically significant
+
+pairwise_DESEQ = function(phyloseq, vari, ref, g2){
+  ### SET ALPHA LEVEL ###
+  alpha = 0.05
+  
+  # Convert from phyloseq to DESeq2 object
+  model_call <- as.formula(paste0("~",vari))
+  diagdds = phyloseq_to_deseq2(phyloseq, model_call)
+  # Calculate geometric means as previously described.
+  geoMeans = apply(counts(diagdds), 1, gm_mean)
+  # Estimate size factors
+  diagdds = estimateSizeFactors(diagdds, geoMeans = geoMeans)
+  # Estimate Dispersions
+  diagdds = estimateDispersions(diagdds)
+  # Get variance?
+  diagvst = getVarianceStabilizedData(diagdds)
+  
+  # Define the comparisons
+  diagdds$location = relevel(diagdds[[vari]], ref = ref)
+
+  #Diff ASVs
+  diagdds = DESeq(diagdds)
+  res = results(diagdds, alpha = alpha)
+  summary(res)
+  res = res[order(res$padj, na.last = NA), ]
+
+  # Save a list of differential ASVs
+  keepASVs = rownames(res[res$padj < alpha, ])
+  keepASVs
+
+  # sort the results table with most significant ASV's at the top
+  sigtab = res[which(res$padj < alpha), ]
+  # Merge the significance table with the ASV taxonomy
+  # This will only work if there is atleast 1 significant ASV
+  sigtab = cbind(as(sigtab, "data.frame"), as(phyloseq@tax_table[rownames(sigtab), ], "matrix"))
+  
+  # Function Output
+  output = list(model_call = model_call,
+                diagdds = diagdds,
+                diagvst = diagvst,
+                res = res,
+                differential_ASVs = keepASVs,
+                sigtab = sigtab)
+  return(output)
+}
+
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+```{r}
+visualize = function(sigtab){
+  theme_set(theme_bw())
+  scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+  }
+  # Phylum order
+  x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+  x = sort(x, TRUE)
+  sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+  # Genus order
+  x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+  x = sort(x, TRUE)
+  sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+  
+  figure = ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+            geom_point(size=2) + 
+            theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+  
+  return(figure)
+}
+
+
+```
+
+
+
+# Compare the distinct clusters discovered through PERMANOVA
+
+```{r}
+ps_final_analyze@sam_data$group = "a"
+
+for(x in 1:dim(ps_final_analyze@sam_data)[1]){
+  if(ps_final_analyze@sam_data$location[x] == "DCF" | ps_final_analyze@sam_data$location[x] == "PCF"){
+  ps_final_analyze@sam_data$group[x] = "colon"
+  }
+
+  if(ps_final_analyze@sam_data$location[x] == "PIF"){
+    ps_final_analyze@sam_data$group[x] = "intestine"
+  }
+
+  if(ps_final_analyze@sam_data$location[x] == "s1" | ps_final_analyze@sam_data$location[x] == "s2" | ps_final_analyze@sam_data$location[x] == "s3"){
+     ps_final_analyze@sam_data$group[x] = "rumen"
+  }
+
+  if(ps_final_analyze@sam_data$location[x] == "s4"){
+    ps_final_analyze@sam_data$group[x] = "abomasum"
+  }
+}
+
+
+
+ps_final_analyze@sam_data$group
+```
+
+```{r}
+# subset phyloseq objects and run DeSEQ2
+figure_width = 11
+figure_height = 5
+
+# Rumen - Abomasum
+rumen_abomasum_phy = subset_ps_2_groups(ps = ps_final_analyze,
+                                        variable = "group",
+                                        g1 = "rumen",
+                                        g2 = "abomasum")
+
+rumen_abomasum_test = pairwise_DESEQ(phyloseq = rumen_abomasum_phy,
+                                     vari = "group",
+                                     ref = "rumen",
+                                     g2 = "abomasum")
+rumen_abomasum_test$sigtab
+write.csv(rumen_abomasum_test$sigtab, file = "differential_sigtab_rumen_abomasum.csv",
+          row.names = TRUE)
+
+figure = visualize(sigtab = rumen_abomasum_test$sigtab)
+ggsave(plot = figure, filename = "differential_fig_rumen_abomasum.png", width = figure_width, height = figure_height, units = "in", dpi = 300)
+
+# Rumen - PIF
+rumen_pif_phy = subset_ps_2_groups(ps = ps_final_analyze,
+                                        variable = "group",
+                                        g1 = "rumen",
+                                        g2 = "intestine")
+
+rumen_pif_test = pairwise_DESEQ(phyloseq = rumen_pif_phy,
+                                     vari = "group",
+                                     ref = "rumen",
+                                     g2 = "intestine")
+rumen_pif_test$sigtab
+write.csv(rumen_pif_test$sigtab, file = "differential_sigtab_rumen_pif.csv", row.names = TRUE)
+
+figure = visualize(sigtab = rumen_pif_test$sigtab)
+ggsave(plot = figure, filename = "differential_fig_rumen_pif.png", width = figure_width, height = figure_height, units = "in", dpi = 300)
+
+# Rumen - colon
+
+rumen_colon_phy = subset_ps_2_groups(ps = ps_final_analyze,
+                                        variable = "group",
+                                        g1 = "rumen",
+                                        g2 = "colon")
+
+rumen_colon_test = pairwise_DESEQ(phyloseq = rumen_colon_phy,
+                                     vari = "group",
+                                     ref = "rumen",
+                                     g2 = "colon")
+rumen_colon_test$sigtab
+write.csv(rumen_colon_test$sigtab, file = "differential_sigtab_rumen_colon.csv", row.names = TRUE)
+
+figure = visualize(sigtab = rumen_colon_test$sigtab)
+ggsave(plot = figure, filename = "differential_fig_rumen_colon.png", width = figure_width, height = figure_height, units = "in", dpi = 300)
+
+# abomasum - intestine
+abomasum_intestine_phy = subset_ps_2_groups(ps = ps_final_analyze,
+                                        variable = "group",
+                                        g1 = "abomasum",
+                                        g2 = "intestine")
+
+abomasum_intestine_test = pairwise_DESEQ(phyloseq = abomasum_intestine_phy,
+                                     vari = "group",
+                                     ref = "abomasum",
+                                     g2 = "intestine") 
+abomasum_intestine_test$sigtab
+write.csv(abomasum_intestine_test$sigtab,  file = "differential_sigtab_abomasu_intestine.csv", row.names = TRUE)
+
+figure = visualize(sigtab = abomasum_intestine_test$sigtab)
+ggsave(plot = figure, filename = "differential_fig_abomasum_intestine.png", width = figure_width, height = figure_height, units = "in", dpi = 300)
+
+# abomasum - colon
+abomasum_colon_phy = subset_ps_2_groups(ps = ps_final_analyze,
+                                        variable = "group",
+                                        g1 = "abomasum",
+                                        g2 = "colon")
+
+abomasum_colon_test = pairwise_DESEQ(phyloseq = abomasum_colon_phy,
+                                     vari = "group",
+                                     ref = "abomasum",
+                                     g2 = "colon") 
+abomasum_colon_test$sigtab
+write.csv(abomasum_colon_test$sigtab, file = "differential_sigtab_abomasum_colon.csv", row.names = TRUE)
+
+figure = visualize(sigtab = abomasum_colon_test$sigtab)
+ggsave(plot = figure, filename = "differential_fig_abomasum_colon.png", width = figure_width, height = figure_height, units = "in", dpi = 300)
+
+# intestine - colon
+intestine_colon_phy = subset_ps_2_groups(ps = ps_final_analyze,
+                                        variable = "group",
+                                        g1 = "intestine",
+                                        g2 = "colon")
+
+intestine_colon_test = pairwise_DESEQ(phyloseq = intestine_colon_phy,
+                                     vari = "group",
+                                     ref = "intestine",
+                                     g2 = "colon") 
+intestine_colon_test$sigtab
+write.csv(intestine_colon_test$sigtab, file = "differential_sigtab_intestine_colon.csv", row.names = TRUE)
+
+figure = visualize(sigtab = intestine_colon_test$sigtab)
+ggsave(plot = figure, filename = "differential_fig_intestine_colon.png", width = figure_width, height = figure_height, units = "in", dpi = 300)
+```
+
+
+
+
+# Subsetting phyloseq object
+
+I want to look at differential abundance between all the groups individually. For location, I will need to create subset `phyloseq` objects that have only two sample locations present.
+
+- DCF - PCF
+- DCF - PIF
+- DCF - s1
+- DCF - s2
+- DCF - s3
+- DCF - s4
+- PCF - PIF
+- PCF - s1
+- PCF - s2
+- PCF - s3
+- PCF - s4
+- PIF - s1
+- PIF - s2
+- PIF - s3
+- PIF - s4
+- s1 - s2
+- s1 - s3
+- s1 - s4
+- s2 - s3
+- s2 - s4
+- s3 - s4
+
+I will use phyloseq's `subset_samples()` function to keep only two locations in each subset phyloseq object
+```{r}
+#| eval: false
+
+# Create only DCF - PCF subset
+dcf.pcfSubset = subset_samples(ps_final_analyze, location != "PIF")
+dcf.pcfSubset = subset_samples(dcf.pcfSubset, location != "s1")
+dcf.pcfSubset = subset_samples(dcf.pcfSubset, location != "s2")
+dcf.pcfSubset = subset_samples(dcf.pcfSubset, location != "s3")
+dcf.pcfSubset = subset_samples(dcf.pcfSubset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(dcf.pcfSubset)$location
+
+# Create only DCF - PIF subset
+dcf.pifSubset = subset_samples(ps_final_analyze, location != "PCF")
+dcf.pifSubset = subset_samples(dcf.pifSubset, location != "s1")
+dcf.pifSubset = subset_samples(dcf.pifSubset, location != "s2")
+dcf.pifSubset = subset_samples(dcf.pifSubset, location != "s3")
+dcf.pifSubset = subset_samples(dcf.pifSubset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(dcf.pifSubset)$location
+
+# Create only DCF - s1 subset
+dcf.s1Subset = subset_samples(ps_final_analyze, location != "PCF")
+dcf.s1Subset = subset_samples(dcf.s1Subset, location != "PIF")
+dcf.s1Subset = subset_samples(dcf.s1Subset, location != "s2")
+dcf.s1Subset = subset_samples(dcf.s1Subset, location != "s3")
+dcf.s1Subset = subset_samples(dcf.s1Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(dcf.s1Subset)$location
+
+# Create only DCF - s2 subset
+dcf.s2Subset = subset_samples(ps_final_analyze, location != "PCF")
+dcf.s2Subset = subset_samples(dcf.s2Subset, location != "PIF")
+dcf.s2Subset = subset_samples(dcf.s2Subset, location != "s1")
+dcf.s2Subset = subset_samples(dcf.s2Subset, location != "s3")
+dcf.s2Subset = subset_samples(dcf.s2Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(dcf.s2Subset)$location
+
+# Create only DCF - s3 subset
+dcf.s3Subset = subset_samples(ps_final_analyze, location != "PCF")
+dcf.s3Subset = subset_samples(dcf.s3Subset, location != "PIF")
+dcf.s3Subset = subset_samples(dcf.s3Subset, location != "s1")
+dcf.s3Subset = subset_samples(dcf.s3Subset, location != "s2")
+dcf.s3Subset = subset_samples(dcf.s3Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(dcf.s3Subset)$location
+
+# Create only DCF - s4 subset
+dcf.s4Subset = subset_samples(ps_final_analyze, location != "PCF")
+dcf.s4Subset = subset_samples(dcf.s4Subset, location != "PIF")
+dcf.s4Subset = subset_samples(dcf.s4Subset, location != "s1")
+dcf.s4Subset = subset_samples(dcf.s4Subset, location != "s2")
+dcf.s4Subset = subset_samples(dcf.s4Subset, location != "s3")
+# Check to make sure only correct samples remain
+sample_data(dcf.s4Subset)$location
+
+# Create only PCF - PIF subset
+pcf.pifSubset = subset_samples(ps_final_analyze, location != "DCF")
+pcf.pifSubset = subset_samples(pcf.pifSubset, location != "s1")
+pcf.pifSubset = subset_samples(pcf.pifSubset, location != "s2")
+pcf.pifSubset = subset_samples(pcf.pifSubset, location != "s3")
+pcf.pifSubset = subset_samples(pcf.pifSubset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(pcf.pifSubset)$location
+
+# Create only PCF - s1 subset
+pcf.s1Subset = subset_samples(ps_final_analyze, location != "DCF")
+pcf.s1Subset = subset_samples(pcf.s1Subset, location != "PIF")
+pcf.s1Subset = subset_samples(pcf.s1Subset, location != "s2")
+pcf.s1Subset = subset_samples(pcf.s1Subset, location != "s3")
+pcf.s1Subset = subset_samples(pcf.s1Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(pcf.s1Subset)$location
+
+# Create only PCF - s2 subset
+pcf.s2Subset = subset_samples(ps_final_analyze, location != "DCF")
+pcf.s2Subset = subset_samples(pcf.s2Subset, location != "PIF")
+pcf.s2Subset = subset_samples(pcf.s2Subset, location != "s1")
+pcf.s2Subset = subset_samples(pcf.s2Subset, location != "s3")
+pcf.s2Subset = subset_samples(pcf.s2Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(pcf.s2Subset)$location
+
+# Create only PCF - s3 subset
+pcf.s3Subset = subset_samples(ps_final_analyze, location != "DCF")
+pcf.s3Subset = subset_samples(pcf.s3Subset, location != "PIF")
+pcf.s3Subset = subset_samples(pcf.s3Subset, location != "s1")
+pcf.s3Subset = subset_samples(pcf.s3Subset, location != "s2")
+pcf.s3Subset = subset_samples(pcf.s3Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(pcf.s3Subset)$location
+
+# Create only PCF - s4 subset
+pcf.s4Subset = subset_samples(ps_final_analyze, location != "DCF")
+pcf.s4Subset = subset_samples(pcf.s4Subset, location != "PIF")
+pcf.s4Subset = subset_samples(pcf.s4Subset, location != "s1")
+pcf.s4Subset = subset_samples(pcf.s4Subset, location != "s2")
+pcf.s4Subset = subset_samples(pcf.s4Subset, location != "s3")
+# Check to make sure only correct samples remain
+sample_data(pcf.s4Subset)$location
+
+# Create only PIF - s1 subset
+pif.s1Subset = subset_samples(ps_final_analyze, location != "DCF")
+pif.s1Subset = subset_samples(pif.s1Subset, location != "PCF")
+pif.s1Subset = subset_samples(pif.s1Subset, location != "s2")
+pif.s1Subset = subset_samples(pif.s1Subset, location != "s3")
+pif.s1Subset = subset_samples(pif.s1Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(pif.s1Subset)$location
+
+# Create only PIF - s2 subset
+pif.s2Subset = subset_samples(ps_final_analyze, location != "DCF")
+pif.s2Subset = subset_samples(pif.s2Subset, location != "PCF")
+pif.s2Subset = subset_samples(pif.s2Subset, location != "s1")
+pif.s2Subset = subset_samples(pif.s2Subset, location != "s3")
+pif.s2Subset = subset_samples(pif.s2Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(pif.s2Subset)$location
+
+# Create only PIF - s3 subset
+pif.s3Subset = subset_samples(ps_final_analyze, location != "DCF")
+pif.s3Subset = subset_samples(pif.s3Subset, location != "PCF")
+pif.s3Subset = subset_samples(pif.s3Subset, location != "s1")
+pif.s3Subset = subset_samples(pif.s3Subset, location != "s2")
+pif.s3Subset = subset_samples(pif.s3Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(pif.s3Subset)$location
+
+# Create only PIF - s4 subset
+pif.s4Subset = subset_samples(ps_final_analyze, location != "DCF")
+pif.s4Subset = subset_samples(pif.s4Subset, location != "PCF")
+pif.s4Subset = subset_samples(pif.s4Subset, location != "s1")
+pif.s4Subset = subset_samples(pif.s4Subset, location != "s2")
+pif.s4Subset = subset_samples(pif.s4Subset, location != "s3")
+# Check to make sure only correct samples remain
+sample_data(pif.s4Subset)$location
+
+# Create only s1 - s2 subset
+s1.s2Subset = subset_samples(ps_final_analyze, location != "DCF")
+s1.s2Subset = subset_samples(s1.s2Subset, location != "PCF")
+s1.s2Subset = subset_samples(s1.s2Subset, location != "PIF")
+s1.s2Subset = subset_samples(s1.s2Subset, location != "s3")
+s1.s2Subset = subset_samples(s1.s2Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(s1.s2Subset)$location
+
+# Create only s1 - s3 subset
+s1.s3Subset = subset_samples(ps_final_analyze, location != "DCF")
+s1.s3Subset = subset_samples(s1.s3Subset, location != "PCF")
+s1.s3Subset = subset_samples(s1.s3Subset, location != "PIF")
+s1.s3Subset = subset_samples(s1.s3Subset, location != "s2")
+s1.s3Subset = subset_samples(s1.s3Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(s1.s3Subset)$location
+
+# Create only s1 - s4 subset
+s1.s4Subset = subset_samples(ps_final_analyze, location != "DCF")
+s1.s4Subset = subset_samples(s1.s4Subset, location != "PCF")
+s1.s4Subset = subset_samples(s1.s4Subset, location != "PIF")
+s1.s4Subset = subset_samples(s1.s4Subset, location != "s2")
+s1.s4Subset = subset_samples(s1.s4Subset, location != "s3")
+# Check to make sure only correct samples remain
+sample_data(s1.s4Subset)$location
+
+# Create only s2 - s3 subset
+s2.s3Subset = subset_samples(ps_final_analyze, location != "DCF")
+s2.s3Subset = subset_samples(s2.s3Subset, location != "PCF")
+s2.s3Subset = subset_samples(s2.s3Subset, location != "PIF")
+s2.s3Subset = subset_samples(s2.s3Subset, location != "s1")
+s2.s3Subset = subset_samples(s2.s3Subset, location != "s4")
+# Check to make sure only correct samples remain
+sample_data(s2.s3Subset)$location
+
+# Create only s2 - s4 subset
+s2.s4Subset = subset_samples(ps_final_analyze, location != "DCF")
+s2.s4Subset = subset_samples(s2.s4Subset, location != "PCF")
+s2.s4Subset = subset_samples(s2.s4Subset, location != "PIF")
+s2.s4Subset = subset_samples(s2.s4Subset, location != "s1")
+s2.s4Subset = subset_samples(s2.s4Subset, location != "s3")
+# Check to make sure only correct samples remain
+sample_data(s2.s4Subset)$location
+
+# Create only s3 - s4 subset
+s3.s4Subset = subset_samples(ps_final_analyze, location != "DCF")
+s3.s4Subset = subset_samples(s3.s4Subset, location != "PCF")
+s3.s4Subset = subset_samples(s3.s4Subset, location != "PIF")
+s3.s4Subset = subset_samples(s3.s4Subset, location != "s1")
+s3.s4Subset = subset_samples(s3.s4Subset, location != "s2")
+# Check to make sure only correct samples remain
+sample_data(s3.s4Subset)$location
+
+```
+
+# Find Differential ASVs
+
+## Differences by Gut Location
+
+
+
+
+
+
+### Comparison 1: DCF to PCF
+
+```{r}
+#| eval: false
+
+# Convert from phyloseq to DESeq2 object
+diagdds1 = phyloseq_to_deseq2(dcf.pcfSubset, ~ location)
+# Calculate geometric means as previously described.
+geoMeans1 = apply(counts(diagdds1), 1, gm_mean)
+# Estimate size factors
+diagdds1 = estimateSizeFactors(diagdds1, geoMeans = geoMeans1)
+# Estimate Dispersions
+diagdds1 = estimateDispersions(diagdds1)
+# Get variance? 
+diagvst1 = getVarianceStabilizedData(diagdds1)
+
+# Define the comparisons: Compare PCF against DCF
+diagdds1$location = relevel(diagdds1$location, ref = "DCF")
+
+#Diff ASVs
+diagdds1 = DESeq(diagdds1)  
+res1 = results(diagdds1, alpha = alpha)
+summary(res1)
+res1 = res1[order(res1$padj, na.last = NA), ]
+
+# Save a list of differential ASVs
+keepASVs25_DCF_PCF = rownames(res1[res1$padj < alpha, ])
+keepASVs25_DCF_PCF
+
+# Make a phyloseq object with only the differential ASVs
+# Note: This phyloseq object will have relative abundances not the count value
+DCF.PCFtrim25 = prune_taxa(keepASVs25_DCF_PCF, norm_mock)
+DCF.PCFtrim25
+save(DCF.PCFtrim25, file = "DCF.PCFtrim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+# Note: this otu table will have relative abundances: not counts of reads
+write.table(otu_table(DCF.PCFtrim25), "DCF_PCF_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res1[which(res1$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(dcf.pcfSubset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_DCF_PCF_sigtab.csv", row.names = TRUE)
+```
+
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+# Set plot window parameters according to how many ASVs you want to visualize
+par(mfrow=c(1,1))
+
+plotCounts(diagdds1, gene="ASV_945", intgroup="location")
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res1)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 2: DCF to PIF
+```{r}
+#| eval: false
+
+# Convert from phyloseq to DESeq2 object
+diagdds2 = phyloseq_to_deseq2(dcf.pifSubset, ~ location)
+# Calculate geometric means as previously described.
+geoMeans2 = apply(counts(diagdds2), 1, gm_mean)
+# Estimate size factors
+diagdds2 = estimateSizeFactors(diagdds2, geoMeans = geoMeans2)
+# Estimate Dispersions
+diagdds2 = estimateDispersions(diagdds2)
+# Get variance? 
+diagvst2 = getVarianceStabilizedData(diagdds2)
+
+# Define the comparisons: Compare PIF against DCF
+diagdds2$location = relevel(diagdds2$location, ref = "DCF")
+
+#Diff ASVs
+diagdds2 = DESeq(diagdds2)  
+res2 = results(diagdds2, alpha = alpha)
+summary(res2)
+res2 = res2[order(res2$padj, na.last = NA), ]
+
+# Save a list of differential ASVs
+keepASVs25_DCF_PIF = rownames(res2[res2$padj < alpha, ])[1:470]
+keepASVs25_DCF_PIF
+
+# Make a phyloseq object with only the differential ASVs
+# Note: This phyloseq object will have relative abundances not the count value
+DCF.PIFtrim25 = prune_taxa(keepASVs25_DCF_PIF, norm_mock)
+DCF.PIFtrim25
+save(DCF.PIFtrim25, file = "DCF.PIFtrim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+# Note: this otu table will have relative abundances: not counts of reads
+write.table(otu_table(DCF.PIFtrim25), "DCF_PIF_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res2[which(res2$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(dcf.pifSubset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_DCF_PIF_sigtab.csv", row.names = TRUE)
+```
+
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+# Set plot window parameters according to how many ASVs you want to visualize
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds2, gene= keepASVs25_DCF_PIF[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res2)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 3: DCF to s1
+```{r}
+#| eval: false
+
+
+# Convert from phyloseq to DESeq2 object
+diagdds3 = phyloseq_to_deseq2(dcf.s1Subset, ~ location)
+# Calculate geometric means as previously described.
+geoMeans3 = apply(counts(diagdds3), 1, gm_mean)
+# Estimate size factors
+diagdds3 = estimateSizeFactors(diagdds3, geoMeans = geoMeans3)
+# Estimate Dispersions
+diagdds3 = estimateDispersions(diagdds3)
+# Get variance? 
+diagvst3 = getVarianceStabilizedData(diagdds3)
+
+# Define the comparisons: Compare s1 against DCF
+diagdds3$location = relevel(diagdds3$location, ref = "DCF")
+
+#Diff ASVs
+diagdds3 = DESeq(diagdds3)  
+res3 = results(diagdds3, alpha = alpha)
+summary(res3)
+res3 = res3[order(res3$padj, na.last = NA), ]
+
+# Save a list of differential ASVs
+keepASVs25_DCF_s1 = rownames(res3[res3$padj < alpha, ])[1:680]
+keepASVs25_DCF_s1
+
+# Make a phyloseq object with only the differential ASVs
+# Note: This phyloseq object will have relative abundances not the count value
+DCF.s1trim25 = prune_taxa(keepASVs25_DCF_s1, norm_mock)
+DCF.s1trim25
+save(DCF.s1trim25, file = "DCF.s1trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+# Note: this otu table will have relative abundances: not counts of reads
+write.table(otu_table(DCF.s1trim25), "DCF_s1_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+
+# sort the results table with most significant ASV's at the top
+sigtab = res3[which(res3$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(dcf.s1Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_DCF_s1_sigtab.csv", row.names = TRUE)
+```
+
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+
+# Set plot window parameters according to how many ASVs you want to visualize
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds3, gene= keepASVs25_DCF_s1[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res3)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 4: DCF to s2
+```{r}
+#| eval: false
+
+# Convert from phyloseq to DESeq2 object
+diagdds4 = phyloseq_to_deseq2(dcf.s2Subset, ~ location)
+# Calculate geometric means as previously described
+geoMeans4 = apply(counts(diagdds4), 1, gm_mean)
+# Estimate size factors
+diagdds4 = estimateSizeFactors(diagdds4, geoMeans = geoMeans4)
+# Estimate Dispersions
+diagdds4 = estimateDispersions(diagdds4)
+# Get variance? 
+diagvst4 = getVarianceStabilizedData(diagdds4)
+
+# Define the comparisons: Compare s2 against DCF
+diagdds4$location = relevel(diagdds4$location, ref = "DCF")
+
+#Diff ASVs
+diagdds4 = DESeq(diagdds4)  
+res4 = results(diagdds4, alpha = alpha)
+res4 = res4[order(res4$padj, na.last = NA), ]
+summary(res4)
+
+# Save a list of differential ASVs
+keepASVs25_DCF_s2 = rownames(res4[res4$padj < alpha, ])[1:680]
+keepASVs25_DCF_s2
+
+# Make a phyloseq object with only the differential ASVs
+# Note: This phyloseq object will have relative abundances not the count value
+DCF.s2trim25 = prune_taxa(keepASVs25_DCF_s2, norm_mock)
+DCF.s2trim25
+save(DCF.s2trim25, file = "DCF.s2trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+# Note: this otu table will have relative abundances: not counts of reads
+write.table(otu_table(DCF.s2trim25), "DCF_s2_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res4[which(res4$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(dcf.s2Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_DCF_s2_sigtab.csv", row.names = TRUE)
+```
+
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts 
+```{r}
+#| eval: false
+
+# Set plot window parameters according to how many ASVs you want to visualize
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds4, gene= keepASVs25_DCF_s2[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res4)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 5: DCF to s3
+
+```{r}
+#| eval: false
+
+diagdds5 = phyloseq_to_deseq2(dcf.s3Subset, ~ location)
+# Calculate geometric means as previously described
+geoMeans5 = apply(counts(diagdds5), 1, gm_mean)
+diagdds5 = estimateSizeFactors(diagdds5, geoMeans = geoMeans5)
+diagdds5 = estimateDispersions(diagdds5)
+diagvst5 = getVarianceStabilizedData(diagdds5)
+
+# Define the comparisons: Compare s3 against DCF
+diagdds5$location = relevel(diagdds5$location, ref = "DCF")
+
+#Diff ASVs
+diagdds5 = DESeq(diagdds5)  
+res5 = results(diagdds5, alpha = alpha)
+res5 = res5[order(res5$padj, na.last = NA), ]
+summary(res5)
+
+# Save a list of differential ASVs
+keepASVs25_DCF_s3 = rownames(res5[res5$padj < alpha, ])[1:690]
+keepASVs25_DCF_s3
+
+# Make a phyloseq object with only the differential ASVs
+DCF.s3trim25 = prune_taxa(keepASVs25_DCF_s3, norm_mock)
+DCF.s3trim25
+save(DCF.s3trim25, file = "DCF.s3trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Look at what the taxonmy of the ASV is.
+head(DCF.s3trim25@tax_table)
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(DCF.s3trim25), "DCF_s3_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res5[which(res5$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(dcf.s3Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_DCF_s3_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds5, gene= keepASVs25_DCF_s3[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res5)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 6: DCF to s4
+
+```{r}
+#| eval: false
+
+diagdds6 = phyloseq_to_deseq2(dcf.s4Subset, ~ location)
+
+geoMeans6 = apply(counts(diagdds6), 1, gm_mean)
+diagdds6 = estimateSizeFactors(diagdds6, geoMeans = geoMeans6)
+diagdds6 = estimateDispersions(diagdds6)
+diagvst6 = getVarianceStabilizedData(diagdds6)
+
+# Define the comparisons: Compare s4 against DCF
+diagdds6$location = relevel(diagdds6$location, ref = "DCF")
+
+#Diff ASVs
+diagdds6 = DESeq(diagdds6)  
+res6 = results(diagdds6, alpha = alpha)
+res6 = res6[order(res6$padj, na.last = NA), ]
+summary(res6)
+
+# Save a list of differential ASVs
+keepASVs25_DCF_s4 = rownames(res6[res6$padj < alpha, ])[1:580]
+keepASVs25_DCF_s4
+
+# Make a phyloseq object with only the differential ASVs
+DCF.s4trim25 = prune_taxa(keepASVs25_DCF_s4, norm_mock)
+DCF.s4trim25
+save(DCF.s4trim25, file = "DCF.s4trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(DCF.s4trim25), "DCF_s4_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res6[which(res6$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(dcf.s4Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_DCF_s4_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts 
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds6, gene= keepASVs25_DCF_s4[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res6)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 7: PCF to PIF
+
+```{r}
+#| eval: false
+
+diagdds7 = phyloseq_to_deseq2(pcf.pifSubset, ~ location)
+
+geoMeans7 = apply(counts(diagdds7), 1, gm_mean)
+diagdds7 = estimateSizeFactors(diagdds7, geoMeans = geoMeans7)
+diagdds7 = estimateDispersions(diagdds7)
+diagvst7 = getVarianceStabilizedData(diagdds7)
+
+# Define the comparisons: Compare PIF against PCF
+diagdds7$location = relevel(diagdds7$location, ref = "PCF")
+
+#Diff ASVs
+diagdds7 = DESeq(diagdds7)  
+res7 = results(diagdds7, alpha = alpha)
+res7 = res7[order(res7$padj, na.last = NA), ]
+summary(res7)
+
+# Save a list of differential ASVs
+keepASVs25_PCF_PIF = rownames(res7[res7$padj < alpha, ])[1:410]
+keepASVs25_PCF_PIF
+
+# Make a phyloseq object with only the differential ASVs
+PCF.PIFtrim25 = prune_taxa(keepASVs25_PCF_PIF, norm_mock)
+PCF.PIFtrim25
+save(PCF.PIFtrim25, file = "PCF.PIFtrim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(PCF.PIFtrim25), "PCF_PIF_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res7[which(res7$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(pcf.pifSubset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_PCF_PIF_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds7, gene= keepASVs25_PCF_PIF[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res7)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 8: PCF to s1
+
+```{r}
+#| eval: false
+
+diagdds8 = phyloseq_to_deseq2(pcf.s1Subset, ~ location)
+
+geoMeans8 = apply(counts(diagdds8), 1, gm_mean)
+diagdds8 = estimateSizeFactors(diagdds8, geoMeans = geoMeans8)
+diagdds8 = estimateDispersions(diagdds8)
+diagvst8 = getVarianceStabilizedData(diagdds8)
+
+# Define the comparisons: Compare S1 against PCF
+diagdds8$location = relevel(diagdds8$location, ref = "PCF")
+
+#Diff ASVs
+diagdds8 = DESeq(diagdds8)  
+res8 = results(diagdds8, alpha = alpha)
+res8 = res8[order(res8$padj, na.last = NA), ]
+summary(res8)
+
+# Save a list of differential ASVs0
+keepASVs25_PCF_s1 = rownames(res8[res8$padj < alpha, ])[1:800]
+keepASVs25_PCF_s1
+
+# Make a phyloseq object with only the differential ASVs
+PCF.s1trim25 = prune_taxa(keepASVs25_PCF_s1, norm_mock)
+PCF.s1trim25
+save(PCF.s1trim25, file = "PCF.s1trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Look at what the taxonmy of the ASV is.
+head(PCF.s1trim25@tax_table)
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(PCF.s1trim25), "PCF_s1_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res8[which(res8$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(pcf.s1Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_PCF_s1_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds8, gene= keepASVs25_PCF_s1[x] , intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res8)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 9: PCF to s2
+
+```{r}
+#| eval: false
+
+diagdds9 = phyloseq_to_deseq2(pcf.s2Subset, ~ location)
+
+geoMeans9 = apply(counts(diagdds9), 1, gm_mean)
+diagdds9 = estimateSizeFactors(diagdds9, geoMeans = geoMeans9)
+diagdds9 = estimateDispersions(diagdds9)
+diagvst9 = getVarianceStabilizedData(diagdds9)
+
+# Define the comparisons: Compare S2 against PCF
+diagdds9$location = relevel(diagdds9$location, ref = "PCF")
+
+#Diff ASVs
+diagdds9 = DESeq(diagdds9)  
+res9 = results(diagdds9, alpha = alpha)
+res9 = res9[order(res9$padj, na.last = NA), ]
+summary(res9)
+
+# Save a list of differential ASVs0
+keepASVs25_PCF_s2 = rownames(res9[res9$padj < alpha, ])[1:780]
+keepASVs25_PCF_s2
+
+# Make a phyloseq object with only the differential ASVs
+PCF.s2trim25 = prune_taxa(keepASVs25_PCF_s2, norm_mock)
+PCF.s2trim25
+save(PCF.s2trim25, file = "PCF.s2trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(PCF.s2trim25), "PCF_s2_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res9[which(res9$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(pcf.s2Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_PCF_s2_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds9, gene= keepASVs25_PCF_s2[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res9)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 10: PCF to s3
+
+```{r}
+#| eval: false
+
+diagdds10 = phyloseq_to_deseq2(pcf.s3Subset, ~ location)
+
+geoMeans10 = apply(counts(diagdds10), 1, gm_mean)
+diagdds10 = estimateSizeFactors(diagdds10, geoMeans = geoMeans10)
+diagdds10 = estimateDispersions(diagdds10)
+diagvst10 = getVarianceStabilizedData(diagdds10)
+
+# Define the comparisons: Compare S3 against PCF
+diagdds10$location = relevel(diagdds10$location, ref = "PCF")
+
+#Diff ASVs
+diagdds10 = DESeq(diagdds10)  
+res10 = results(diagdds10, alpha = alpha)
+res10 = res10[order(res10$padj, na.last = NA), ]
+summary(res10)
+
+# Save a list of differential ASVs0
+keepASVs25_PCF_s3 = rownames(res10[res10$padj < alpha, ])[1:790]
+keepASVs25_PCF_s3
+
+# Make a phyloseq object with only the differential ASVs
+PCF.s3trim25 = prune_taxa(keepASVs25_PCF_s3, norm_mock)
+PCF.s3trim25
+save(PCF.s3trim25, file = "PCF.s3trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(PCF.s3trim25), "PCF_s3_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res10[which(res10$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(pcf.s3Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_PCF_s3_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds10, gene= keepASVs25_PCF_s3[x] , intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res10)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 11: PCF to s4
+
+```{r}
+#| eval: false
+
+diagdds11 = phyloseq_to_deseq2(pcf.s4Subset, ~ location)
+
+geoMeans11 = apply(counts(diagdds11), 1, gm_mean)
+diagdds11 = estimateSizeFactors(diagdds11, geoMeans = geoMeans11)
+diagdds11 = estimateDispersions(diagdds11)
+diagvst11 = getVarianceStabilizedData(diagdds11)
+
+# Define the comparisons: Compare S4 against PCF
+diagdds11$location = relevel(diagdds11$location, ref = "PCF")
+
+#Diff ASVs
+diagdds11 = DESeq(diagdds11)  
+res11 = results(diagdds11, alpha = alpha)
+res11 = res11[order(res11$padj, na.last = NA), ]
+summary(res11)
+
+# Save a list of differential ASVs0
+keepASVs25_PCF_s4 = rownames(res11[res11$padj < alpha, ])[1:720]
+keepASVs25_PCF_s4
+
+# Make a phyloseq object with only the differential ASVs
+PCF.s4trim25 = prune_taxa(keepASVs25_PCF_s4, norm_mock)
+PCF.s4trim25
+save(PCF.s4trim25, file = "PCF.s4trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(PCF.s4trim25), "PCF_s4_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res11[which(res11$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(pcf.s4Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_PCF_s4_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds11, gene= keepASVs25_PCF_s4[x] , intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res11)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 12: PIF to s1
+
+```{r}
+#| eval: false
+
+diagdds12 = phyloseq_to_deseq2(pif.s1Subset, ~ location)
+
+geoMeans12 = apply(counts(diagdds12), 1, gm_mean)
+diagdds12 = estimateSizeFactors(diagdds12, geoMeans = geoMeans12)
+diagdds12 = estimateDispersions(diagdds12)
+diagvst12 = getVarianceStabilizedData(diagdds12)
+
+# Define the comparisons: Compare S1 against PIF
+diagdds12$location = relevel(diagdds12$location, ref = "PIF")
+
+#Diff ASVs
+diagdds12 = DESeq(diagdds12)  
+res12 = results(diagdds12, alpha = alpha)
+res12 = res12[order(res12$padj, na.last = NA), ]
+summary(res12)
+
+# Save a list of differential ASVs0
+keepASVs25_PIF_s1 = rownames(res12[res12$padj < alpha, ])[1:490]
+keepASVs25_PIF_s1
+
+# Make a phyloseq object with only the differential ASVs
+PIF.s1trim25 = prune_taxa(keepASVs25_PIF_s1, norm_mock)
+PIF.s1trim25
+save(PIF.s1trim25, file = "PIF.s1trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(PIF.s1trim25), "PIF_s1_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res12[which(res12$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(pif.s1Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_PIF_s1_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=12}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds12, gene= keepASVs25_PIF_s1[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res12)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 13: PIF to s2
+
+```{r}
+#| eval: false
+
+
+diagdds13 = phyloseq_to_deseq2(pif.s2Subset, ~ location)
+
+geoMeans13 = apply(counts(diagdds13), 1, gm_mean)
+diagdds13 = estimateSizeFactors(diagdds13, geoMeans = geoMeans13)
+diagdds13 = estimateDispersions(diagdds13)
+diagvst13 = getVarianceStabilizedData(diagdds13)
+
+# Define the comparisons: Compare S2 against PIF
+diagdds13$location = relevel(diagdds13$location, ref = "PIF")
+
+#Diff ASVs
+diagdds13 = DESeq(diagdds13)  
+res13 = results(diagdds13, alpha = alpha)
+res13 = res13[order(res13$padj, na.last = NA), ]
+summary(res13)
+
+# Save a list of differential ASVs0
+keepASVs25_PIF_s2 = rownames(res13[res13$padj < alpha, ])[1:490]
+keepASVs25_PIF_s2
+
+# Make a phyloseq object with only the differential ASVs
+PIF.s2trim25 = prune_taxa(keepASVs25_PIF_s2, norm_mock)
+PIF.s2trim25
+save(PIF.s2trim25, file = "PIF.s2trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(PIF.s2trim25), "PIF_s2_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res13[which(res13$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(pif.s2Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_PIF_s2_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=12}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds13, gene= keepASVs25_PIF_s2[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res13)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 14: PIF to s3
+
+```{r}
+#| eval: false
+
+diagdds14 = phyloseq_to_deseq2(pif.s3Subset, ~ location)
+
+geoMeans14 = apply(counts(diagdds14), 1, gm_mean)
+diagdds14 = estimateSizeFactors(diagdds14, geoMeans = geoMeans14)
+diagdds14 = estimateDispersions(diagdds14)
+diagvst14 = getVarianceStabilizedData(diagdds14)
+
+# Define the comparisons: Compare S3 against PIF
+diagdds14$location = relevel(diagdds14$location, ref = "PIF")
+
+#Diff ASVs
+diagdds14 = DESeq(diagdds14)  
+res14 = results(diagdds14, alpha = alpha)
+res14 = res14[order(res14$padj, na.last = NA), ]
+summary(res14)
+
+# Save a list of differential ASVs0
+keepASVs25_PIF_s3 = rownames(res14[res14$padj < alpha, ])[1:470]
+keepASVs25_PIF_s3
+
+# Make a phyloseq object with only the differential ASVs
+PIF.s3trim25 = prune_taxa(keepASVs25_PIF_s3, norm_mock)
+PIF.s3trim25
+save(PIF.s3trim25, file = "PIF.s3trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(PIF.s3trim25), "PIF_s3_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res14[which(res14$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(pif.s3Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_PIF_s3_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds14, gene= keepASVs25_PIF_s3[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res14)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 15: PIF to s4
+
+```{r}
+#| eval: false
+
+diagdds15 = phyloseq_to_deseq2(pif.s4Subset, ~ location)
+
+geoMeans15 = apply(counts(diagdds15), 1, gm_mean)
+diagdds15 = estimateSizeFactors(diagdds15, geoMeans = geoMeans15)
+diagdds15 = estimateDispersions(diagdds15)
+diagvst15 = getVarianceStabilizedData(diagdds15)
+
+# Define the comparisons: Compare S4 against PIF
+diagdds15$location = relevel(diagdds15$location, ref = "PIF")
+
+#Diff ASVs
+diagdds15 = DESeq(diagdds15)  
+res15 = results(diagdds15, alpha = alpha)
+res15 = res15[order(res15$padj, na.last = NA), ]
+summary(res15)
+
+# Save a list of differential ASVs0
+keepASVs25_PIF_s4 = rownames(res15[res15$padj < alpha, ])[1:510]
+keepASVs25_PIF_s4
+
+# Make a phyloseq object with only the differential ASVs
+PIF.s4trim25 = prune_taxa(keepASVs25_PIF_s4, norm_mock)
+PIF.s4trim25
+save(PIF.s4trim25, file = "PIF.s4trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(PIF.s4trim25), "PIF_s4_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res15[which(res15$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(pif.s4Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_PIF_s4_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds15, gene= keepASVs25_PIF_s4[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res15)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 16: s1 to s2
+
+```{r}
+#| eval: false
+
+diagdds16 = phyloseq_to_deseq2(s1.s2Subset, ~ location)
+
+geoMeans16 = apply(counts(diagdds16), 1, gm_mean)
+diagdds16 = estimateSizeFactors(diagdds16, geoMeans = geoMeans16)
+diagdds16 = estimateDispersions(diagdds16)
+diagvst16 = getVarianceStabilizedData(diagdds16)
+
+# Define the comparisons: Compare S2 against s1
+diagdds16$location = relevel(diagdds16$location, ref = "s1")
+
+#Diff ASVs
+diagdds16 = DESeq(diagdds16)  
+res16 = results(diagdds16, alpha = alpha)
+res16 = res16[order(res16$padj, na.last = NA), ]
+summary(res16)
+
+# Save a list of differential ASVs0
+keepASVs25_s1_s2 = rownames(res16[res16$padj < alpha, ])[1:25]
+keepASVs25_s1_s2  
+
+# There are no differential ASVs
+
+```
+
+
+
+### Comparison 17: s1 to s3
+
+```{r}
+#| eval: false
+
+diagdds17 = phyloseq_to_deseq2(s1.s3Subset, ~ location)
+
+geoMeans17 = apply(counts(diagdds17), 1, gm_mean)
+diagdds17 = estimateSizeFactors(diagdds17, geoMeans = geoMeans17)
+diagdds17 = estimateDispersions(diagdds17)
+diagvst17 = getVarianceStabilizedData(diagdds17)
+
+# Define the comparisons: Compare S3 against s1
+diagdds17$location = relevel(diagdds17$location, ref = "s1")
+
+#Diff ASVs
+diagdds17 = DESeq(diagdds17)  
+res17 = results(diagdds17, alpha = alpha)
+res17 = res17[order(res17$padj, na.last = NA), ]
+summary(res17)
+
+# Save a list of differential ASVs0
+keepASVs25_s1_s3 = rownames(res17[res17$padj < alpha, ])[1:25]
+keepASVs25_s1_s3
+
+# There are no differential ASVss
+
+```
+
+
+### Comparison 18: s1 to s4
+
+```{r}
+#| eval: false
+
+
+diagdds18 = phyloseq_to_deseq2(s1.s4Subset, ~ location)
+
+geoMeans18 = apply(counts(diagdds18), 1, gm_mean)
+diagdds18 = estimateSizeFactors(diagdds18, geoMeans = geoMeans18)
+diagdds18 = estimateDispersions(diagdds18)
+diagvst18 = getVarianceStabilizedData(diagdds18)
+
+# Define the comparisons: Compare S4 against s1
+diagdds18$location = relevel(diagdds18$location, ref = "s1")
+
+#Diff ASVs
+diagdds18 = DESeq(diagdds18)  
+res18 = results(diagdds18, alpha = alpha)
+res18 = res18[order(res18$padj, na.last = NA), ]
+summary(res18)
+
+# Save a list of differential ASVs0
+keepASVs25_s1_s4 = rownames(res18[res18$padj < alpha, ])[1:30]
+keepASVs25_s1_s4
+
+# Make a phyloseq object with only the differential ASVs
+s1.s4trim25 = prune_taxa(keepASVs25_s1_s4, norm_mock)
+s1.s4trim25
+save(s1.s4trim25, file = "s1.s4trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(s1.s4trim25), "s1_s4_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res18[which(res18$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s1.s4Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_s1_s4_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds18, gene= keepASVs25_s1_s4[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res18)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 19: s2 to s3
+
+```{r}
+#| eval: false
+
+diagdds19 = phyloseq_to_deseq2(s2.s3Subset, ~ location)
+
+geoMeans19 = apply(counts(diagdds19), 1, gm_mean)
+diagdds19 = estimateSizeFactors(diagdds19, geoMeans = geoMeans19)
+diagdds19 = estimateDispersions(diagdds19)
+diagvst19 = getVarianceStabilizedData(diagdds19)
+
+# Define the comparisons: Compare S3 against s2
+diagdds19$location = relevel(diagdds19$location, ref = "s2")
+
+#Diff ASVs
+diagdds19 = DESeq(diagdds19)  
+res19 = results(diagdds19, alpha = alpha)
+res19 = res19[order(res19$padj, na.last = NA), ]
+summary(res19)
+
+# Save a list of differential ASVs0
+keepASVs25_s2_s3 = rownames(res19[res19$padj < alpha, ])[1:25]
+keepASVs25_s2_s3
+
+# Make a phyloseq object with only the differential ASVs
+s2.s3trim25 = prune_taxa(keepASVs25_s2_s3, norm_mock)
+s2.s3trim25
+save(s2.s3trim25, file = "s2.s3trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(s2.s3trim25), "s2_s3_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res19[which(res19$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s2.s3Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_s2_s3_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(1,2))
+
+for(x in 1:2){
+  plotCounts(diagdds19, gene= keepASVs25_s2_s3[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res19)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 20: s2 to s4
+
+```{r}
+#| eval: false
+
+diagdds20 = phyloseq_to_deseq2(s2.s4Subset, ~ location)
+
+geoMeans20 = apply(counts(diagdds20), 1, gm_mean)
+diagdds20 = estimateSizeFactors(diagdds20, geoMeans = geoMeans20)
+diagdds20 = estimateDispersions(diagdds20)
+diagvst20 = getVarianceStabilizedData(diagdds20)
+
+# Define the comparisons: Compare S4 against s2
+diagdds20$location = relevel(diagdds20$location, ref = "s2")
+
+#Diff ASVs
+diagdds20 = DESeq(diagdds20)  
+res20 = results(diagdds20, alpha = alpha)
+res20 = res20[order(res20$padj, na.last = NA), ]
+summary(res20)
+
+# Save a list of differential ASVs0
+keepASVs25_s2_s4 = rownames(res20[res20$padj < alpha, ])[1:35]
+keepASVs25_s2_s4
+
+# Make a phyloseq object with only the differential ASVs
+s2.s4trim25 = prune_taxa(keepASVs25_s2_s4, norm_mock)
+s2.s4trim25
+save(s2.s4trim25, file = "s2.s4trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(s2.s4trim25), "s2_s4_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res20[which(res20$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s2.s4Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_s2_s4_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds20, gene= keepASVs25_s2_s4[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res20)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+### Comparison 21: s3 to s4
+
+```{r}
+#| eval: false
+
+
+diagdds21 = phyloseq_to_deseq2(s3.s4Subset, ~ location)
+
+geoMeans21 = apply(counts(diagdds21), 1, gm_mean)
+diagdds21 = estimateSizeFactors(diagdds21, geoMeans = geoMeans21)
+diagdds21 = estimateDispersions(diagdds21)
+diagvst21 = getVarianceStabilizedData(diagdds21)
+
+# Define the comparisons: Compare S4 against s3
+diagdds21$location = relevel(diagdds21$location, ref = "s3")
+
+#Diff ASVs
+diagdds21 = DESeq(diagdds21)  
+res21 = results(diagdds21, alpha = alpha)
+res21 = res21[order(res21$padj, na.last = NA), ]
+summary(res21)
+
+# Save a list of differential ASVs0
+keepASVs25_s3_s4 = rownames(res21[res21$padj < alpha, ])[1:25]
+keepASVs25_s3_s4
+
+# Make a phyloseq object with only the differential ASVs
+s3.s4trim25 = prune_taxa(keepASVs25_s3_s4, norm_mock)
+s3.s4trim25
+save(s3.s4trim25, file = "s3.s4trim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+write.table(otu_table(s3.s4trim25), "s3_s4_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res21[which(res21$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s3.s4Subset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_s3_s4_sigtab.csv", row.names = TRUE)
+```
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r fig.width=11}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+par(mfrow=c(2,3))
+
+for(x in 1:6){
+  plotCounts(diagdds21, gene= keepASVs25_s3_s4[x], intgroup="location")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res21)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+## Differences by sexes
+
+```{r}
+#| eval: false
+
+# Convert from phyloseq to DESeq2 object
+dds = phyloseq_to_deseq2(ps_final_analyze, ~ Gender)
+
+geoMeans = apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds, geoMeans = geoMeans)
+dds = estimateDispersions(dds)
+diagvst = getVarianceStabilizedData(dds)
+
+# Define the comparisons: Compare males against females
+dds$Gender = relevel(dds$Gender, ref = "Female")
+
+#Diff ASVs
+dds = DESeq(dds)  
+res = results(dds, alpha = alpha)
+res = res[order(res$padj, na.last = NA), ]
+summary(res)
+
+
+# Save a list of differential ASVs
+keepASVs25_gender = rownames(res[res$padj < alpha, ])[1:25]
+
+# Make a phyloseq object with only the differential ASVs
+# Note: This phyloseq object will have relative abundances not the count value
+gendertrim25 = prune_taxa(keepASVs25_gender, norm_mock)
+gendertrim25
+save(gendertrim25, file = "gendertrim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+# Note: this otu table will have relative abundances: not counts of reads
+write.table(otu_table(gendertrim25), "gender_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res[which(res$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(dcf.pcfSubset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_gender_sigtab.csv", row.names = TRUE)
+```
+
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+# Set plot window parameters according to how many ASVs you want to visualize
+par(mfrow=c(1,2))
+
+for(i in 1:2){
+  plotCounts(dds, gene = keepASVs25_gender[i], intgroup="Gender")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+#reset par
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+
+## Differences by herd
+
+```{r}
+#| eval: false
+
+# Convert from phyloseq to DESeq2 object
+dds = phyloseq_to_deseq2(ps_final_analyze, ~ Herd)
+
+geoMeans = apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds, geoMeans = geoMeans)
+dds = estimateDispersions(dds)
+diagvst = getVarianceStabilizedData(dds)
+
+# Define the comparisons: Compare cultural herd against buisness herd
+dds$Herd = relevel(dds$Herd, ref = "Buisness")
+
+#Diff ASVs
+dds = DESeq(dds)  
+res = results(dds, alpha = alpha)
+res = res[order(res$padj, na.last = NA), ]
+summary(res)
+
+# Save a list of differential ASVs
+keepASVs25_herd = rownames(res[res$padj < alpha, ])[1:25]
+keepASVs25_herd
+
+# Make a phyloseq object with only the differential ASVs
+# Note: This phyloseq object will have relative abundances not the count value
+herdtrim25 = prune_taxa(keepASVs25_herd, norm_mock)
+herdtrim25
+save(herdtrim25, file = "herdtrim25.rds")
+#load("DCF.PCFtrim25.rds")
+
+# Make an ASV table of only the the differential ASVs
+# Note: this otu table will have relative abundances: not counts of reads
+write.table(otu_table(herdtrim25), "herd_diff_asv_table.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+```
+
+Make a significance table with taxa
+```{r}
+#| eval: false
+
+# sort the results table with most significant ASV's at the top
+sigtab = res[which(res$padj < alpha), ]
+# Merge the significance table with the ASV taxonomy
+# This will only work if there is atleast 1 significant ASV
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(dcf.pcfSubset)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+write.csv(sigtab, file = "ma_herd_sigtab.csv", row.names = TRUE)
+```
+
+
+Visualize the results. This figure shows the phylum and genus of each differential ASV and its respective log2foldchange. The code for this figure was sourced from [joey711 DESeq2 tutorial](https://joey711.github.io/phyloseq-extensions/DESeq2.html)
+
+```{r}
+#| eval: false
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+Plot the normalized counts
+```{r}
+#| eval: false
+
+# Set plot window parameters according to how many ASVs you want to visualize
+par(mfrow=c(2,3))
+
+for(i in 1:6){
+  plotCounts(dds, gene = keepASVs25_herd[i], intgroup="Herd")
+}
+```
+
+Volcano Plot: Code was sourced from [biostars.org](https://www.biostars.org/p/282295/)
+```{r}
+#| eval: false
+
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+# Limiting the X and y axis
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~Q~value), xlim=c(-10,10), ylim=c(0,10)))
+
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+```
+
+
+# Packages used
+
+- [how to find packages used](https://community.rstudio.com/t/how-to-find-out-which-functions-from-which-packages-were-used-in-rmd-file/71878)
+
+```{r, results = 'hide', message=FALSE}
+#| eval: false
+knitr::purl("Bison_differential_analysis_final_version.Rmd")
+```
+
+```{r}
+# eval: false
+list.functions.in.file("Bison_differential_analysis_final_version.R")
+```
+
+
+# Session information
+```{r}
+sessionInfo()
+```
+
+

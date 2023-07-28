@@ -1,0 +1,1603 @@
+---
+title: "Bison_analysis_mrkdn"
+author: "Krista Starr"
+date: '2022-06-23'
+output: 
+  html_document: 
+    toc: yes
+    fig_width: 9
+    fig_height: 7
+---
+Combination of code from:
+
+- Seidu's 16s visulization: "Filtering_Visualiztion.Rmd" 
+- Seidu's "16S_ANALYSIS_SEIDU_ADAMS.Rmd"
+- Allison's 16s Workshop: "WORKSHOP_Markdown_16S_2021.Rmd"
+- my own additions to fit the codes for the BISON project 2022
+
+output stored in /Samodha Lab/Labmeeting Papers
+
+# Setting Up
+## Load in Libraries
+```{r message=FALSE}
+library("genefilter")
+library("phyloseq")
+library("BiocManager")
+library("import")
+library("knitr")
+library("BiocStyle")
+library("ggplot2")
+library("gridExtra")
+library("dada2")
+library("DECIPHER")
+library("ape")
+library("phangorn")
+library("BiocStyle")
+library("ShortRead")
+library("dplyr")
+library("dunn.test")
+```
+
+## Load completed phyloseq object
+```{r}
+getwd()
+Bison_ps = readRDS("E:\\Bison Project\\Bison_analysis_attempt_3\\Bison_ps_attempt2.rds")
+Bison_ps
+# I misspelled the column name in the original metadata file. Correcting the column name
+names(sample_data(Bison_ps))[15] = "herd"
+```
+
+## Initial Stats
+```{r}
+# Total number of reads in Bison_ps
+sum1 = sum(taxa_sums(Bison_ps)) #4806928 reads
+sum1
+# Total number of ASV's in Bison_ps
+asv1 = dim(Bison_ps@otu_table)[2]
+asv1
+```
+
+In Bison_ps there are:
+
+- There are `r dim(Bison_ps@otu_table)[2]` ASVs
+- There are `r sum(taxa_sums(Bison_ps))` reads
+
+## ASV Ranked abundance histogram
+```{r}
+library("ggplot2")
+#Plot the taxa sums to see how abundant they all are.  I limited the y-axis to better see the long tail of rare taxa.
+tsumabn <- plot(sort(taxa_sums(Bison_ps), TRUE), type="h", ylim=c(0, 1000), ylab="Abundance")
+```
+
+# Begin Filtering Steps
+
+## Filter on Prevalence (>= 2 samples) and abundance (atleast 0.15% abundant in a sample)
+```{r}
+# get relative abundance data
+set.seed(123)
+ps_norm  <-  transform_sample_counts(Bison_ps, function(x) x / sum(x) )
+
+#set the function parameters, 0.15% abundance w/in a sample, and must have that criteria in at least 2 samples
+flist<- filterfun(kOverA(2, 0.0015))
+
+#Use function on your data:
+#this should be performed on your asv table transformed to proportional data
+dd2.logi <- filter_taxa(ps_norm, flist) #create a list of ASVs that meet flist criteria
+head(dd2.logi)
+write.csv(dd2.logi, file = "ASV_filtering_prev_abund.csv", row.names = TRUE)
+
+#Now filter out ASVs that do not meet the criteria kOverA i.e. dd2.logi list...
+dd2.filt.ps = prune_taxa(dd2.logi, Bison_ps)
+dd2.filt.ps 
+```
+
+## Update on Filtering
+```{r}
+# Number of ASV's remaining
+asv2 = dim(dd2.filt.ps@otu_table)[2]
+asv2
+# Number of Reads remaining
+sum2 = sum(taxa_sums(dd2.filt.ps)) 
+sum2
+# Percent of reads that remain
+per2 = (sum(taxa_sums(dd2.filt.ps))/sum(taxa_sums(Bison_ps)))*100
+per2
+```
+
+## Remove unwanted kingdoms
+```{r}
+library(biomehorizon) 
+library(ggplot2)
+
+#making vector to filter out unwanted kingdoms
+remove_kingdoms <- c( "Archaea", "Eukaryota")
+# Remove unwanted kingdoms
+dd2.ps_filtered <- subset_taxa(dd2.filt.ps, !Kingdom %in% remove_kingdoms)
+dd2.ps_filtered
+
+#Saving the final filtered ASVs and removed Archaea and Eukaryota
+save(dd2.ps_filtered, file = "dd2.ps_filtered.rds")
+```
+
+## Update on Filtering
+```{r}
+# Number of ASV's remaining
+asv3 = dim(dd2.ps_filtered@otu_table)[2]
+asv3
+# Number of Reads remaining
+sum3 = sum(taxa_sums(dd2.ps_filtered))
+sum3
+# Percentage of reads remaing
+per3 = (sum(taxa_sums(dd2.ps_filtered))/sum(taxa_sums(dd2.filt.ps)))*100
+per3
+```
+
+## Filter out contamination ASVs
+ASV is present in higher fraction of negative controls than true samples are classified as contamination
+```{r}
+library(decontam)
+
+# KS: Find negative controls
+Bison_meta = read.csv("bison_metadata_analysis.csv")
+
+# Create a column in pyloseq sample data to identify negative controls
+sample_data(dd2.ps_filtered)$is.neg <- sample_data(dd2.ps_filtered)$Sample_name == c("NC3", "NC4", "NC5")
+
+# Create a table inicating which ASVs are considered contamination
+contamdf.prev <- isContaminant(dd2.ps_filtered, method="prevalence", neg="is.neg", batch = sample_data(dd2.ps_filtered)$Run, batch.combine = "minimum")
+head(contamdf.prev)
+write.csv(contamdf.prev, file="contaminat_list.csv", row.names = TRUE)
+
+# gives the number of FALSE (not contaminant) and TRUE (contaminant) ASV's
+table(contamdf.prev$contaminant)
+
+# filtering out contamination
+ps_no_contamination <- prune_taxa(!contamdf.prev$contaminant, dd2.ps_filtered)
+ps_no_contamination
+```
+
+## Update on Filtering
+```{r}
+# Number of ASV's remaining
+asv4 = dim(ps_no_contamination@otu_table)[2]
+asv4
+# Number of Reads remaining
+sum4 = sum(taxa_sums(ps_no_contamination))
+sum4
+# Percentage of reads remaing
+per4 = (sum(taxa_sums(ps_no_contamination)/sum(taxa_sums(dd2.ps_filtered))))*100
+per4
+```
+
+## Filter out the negative control samples
+```{r}
+negs = c("NC3", "NC4", "NC5")
+ps_mock_neg <- subset_samples(ps_no_contamination, sample_data(dd2.ps_filtered)$Sample_name != negs)
+ps_mock_neg
+save(ps_mock_neg, file = "ps_mock_neg.rds")
+```
+
+## Update on Filtering
+```{r}
+# Number of ASV's remaining
+asv5 = dim(ps_mock_neg@otu_table)[2]
+asv5
+# Number of Reads remaining
+sum5 = sum(taxa_sums(ps_mock_neg))
+sum5
+# Percentage of reads remaing
+per5 = (sum(taxa_sums(ps_mock_neg)/sum(taxa_sums(ps_no_contamination))))*100
+per5
+```
+
+## Prunning taxa that do not belong to any sample
+
+```{r}
+ps_mock_analyze <- prune_species(speciesSums(ps_mock_neg) > 0, ps_mock_neg)
+ps_mock_analyze
+```
+
+## Update on Filtering
+```{r}
+# Number of ASV's remaining
+asv6 = dim(ps_mock_analyze@otu_table)[2]
+asv6
+# Number of Reads remaining
+sum6 = sum(taxa_sums(ps_mock_analyze))
+sum6
+# Percentage of reads remaing
+per6 = (sum(taxa_sums(ps_mock_analyze)/sum(taxa_sums(ps_mock_neg))))*100
+per6
+```
+
+## Remove any samples with less than 1000 reads
+```{r}
+ps_final_analyze <- prune_samples(sample_sums(ps_mock_analyze) > 1000, ps_mock_analyze)
+saveRDS(ps_final_analyze, "ps_final_analyze.rds")
+ps_final_analyze 
+```
+
+## Update on Filtering
+```{r}
+# Number of ASV's remaining
+asv7 = dim(ps_final_analyze@otu_table)[2]
+asv7
+# Number of Reads remaining
+sum7 = sum(taxa_sums(ps_final_analyze))
+sum7
+# Percentage of reads remaing
+per7 = (sum(taxa_sums(ps_final_analyze)/sum(taxa_sums(ps_mock_analyze))))*100
+per7
+```
+
+## Track reads through filtering
+This table shows a summary of where reads and ASVs were removed in the filtering steps.  
+
+```{r echo = FALSE}
+asvcount = c(asv1, asv2, asv3, asv4, asv5, asv6, asv7)
+asvper2 = (asv2/asv1)*100
+asvper3 = (asv3/asv2)*100
+asvper4 = (asv4/asv3)*100
+asvper5 = (asv5/asv4)*100
+asvper6 = (asv6/asv5)*100
+asvper7 = (asv7/asv6)*100
+readcount = c(sum1, sum2, sum3, sum4, sum5, sum6, sum7)
+readretained = c(0, per2, per3, per4, per5, per6, per7)
+asvretained = c(0, asvper2, asvper3, asvper4, asvper5, asvper6, asvper7)
+
+readretained = round(readretained, digits = 2)
+asvretained = round(asvretained, digits = 2)
+
+trackReads = data.frame(ASVs = asvcount, ASVs_Retained = asvretained, Reads = readcount, Reads_Retained = readretained)
+row.names(trackReads) = c("Input", "Single Sample & <0.15% relative abundance", "Kingdom Archaea and Eukaryota",
+                          "Contamination ASVs", "Remove negative control samples", "ASV's not in a sample",
+                          "Samples with <1,000 reads")
+
+trackReads$ASVs_Retained[1] = ""
+trackReads$Reads_Retained[1] = ""
+
+library(knitr)
+kable(trackReads, align = "ccccc")
+
+totalasvs = (sum(taxa_sums(ps_final_analyze)/sum(taxa_sums(Bison_ps))))*100
+totalreads = (dim(ps_final_analyze@otu_table)[2] / dim(Bison_ps@otu_table)[2])*100
+
+```
+
+In total `r round(totalasvs, digits = 2)` % of ASVs passed and `r round(totalreads, digits = 2)` % of sequence reads passed.
+
+
+# Cleaning up meta data for visualization purposes 
+
+Create new sample data columns that say Business and Cultural instead of bh and ch
+```{r}
+ps_final_analyze@sam_data$Herd = "Business"
+head(ps_final_analyze@sam_data)
+sampleID = ps_final_analyze@sam_data$SampleID
+for(i in 1:length(sampleID)){
+  if (ps_final_analyze@sam_data$herd[i] == "ch"){
+    ps_final_analyze@sam_data$Herd[i] = "Cultural"
+  }
+  else if(ps_final_analyze@sam_data$herd[i] == "bh"){
+    ps_final_analyze@sam_data$Herd[i] = "Buisness"
+  }
+}
+head(ps_final_analyze@sam_data)
+
+```
+
+Create new sample data colunms that say Male and Female instead of m and f
+```{r}
+ps_final_analyze@sam_data$Gender = "x"
+head(ps_final_analyze@sam_data)
+for(i in 1:length(sampleID)){
+  if (ps_final_analyze@sam_data$gender[i] == "m"){
+    ps_final_analyze@sam_data$Gender[i] = "Male"
+  }
+  else if(ps_final_analyze@sam_data$gender[i] == "f"){
+    ps_final_analyze@sam_data$Gender[i] = "Female"
+  }
+}
+head(ps_final_analyze@sam_data)
+```
+
+Correct two sample identifications:  
+Bison 2 had two replicate samples of the location PIF. In processing they were labled "PIF1" and "PIF2". If I leave this in the metadata, downstream analysis between locations will view these two samples as unique locations instead of grouping them with other samples from the PIF location. Therefore I need to update their location colum to say only "PIF" instead of "PIF1" and "PIF2".
+```{r}
+sample_data(ps_final_analyze)$location[13] = "PIF"
+sample_data(ps_final_analyze)$location[14] = "PIF"
+save(ps_final_analyze, file = "ps_final_analyze.rds")
+```
+
+
+# Exploring Sequencing Depth
+
+## Sequencing depth histogram
+```{r echo = FALSE}
+# create a data frame including sampleID and total reads in that sample
+reads_per_sample_df <- data.frame(Reads = sample_sums(ps_final_analyze)) 
+reads_per_sample_df$sampleID <- rownames(reads_per_sample_df)
+head(reads_per_sample_df)
+reads_per_sample_df <- reads_per_sample_df[,c(2,1)] # reorder columns
+reads_per_sample_df_sorted <- reads_per_sample_df[order(reads_per_sample_df$Reads),] # order samples by read count (ascending)
+head(reads_per_sample_df_sorted) # check that it looks right
+
+#Making histogram to visualize reads
+library('ggplot2'); packageVersion('ggplot2')
+read_depth_histo <- ggplot(reads_per_sample_df_sorted, aes(x = Reads)) + geom_histogram(color = "black", fill = "indianred", binwidth = 2500) + 
+  ggtitle("Sequence depth distribution across samples") + 
+  xlab("Number of reads") + 
+  theme(axis.title.y = element_blank())
+read_depth_histo
+
+```
+
+## Exploring read depth statistics
+```{r}
+# Smallest read depth
+min_read_depth <- min(sample_sums(ps_final_analyze))
+min_read_depth 
+# Largest read depth
+max_read_depth <- max(sample_sums(ps_final_analyze))
+max_read_depth 
+# Mean read depth
+mean(reads_per_sample_df$Reads)
+# Standard Deviation of read depth
+sd(reads_per_sample_df$Reads)
+```
+
+# Rarefaction Curves
+Generate several rarefaction curve variants using the full data set
+
+```{r message = FALSE}
+library(MicrobiotaProcess)
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+library(coin)
+library(reshape2)
+library(ggnewscale)
+```
+
+## Colorcoded by location
+```{r}
+#| warning: false
+
+set.seed(1024)
+rareres <- get_rarecurve(obj=ps_final_analyze, chunks=400)
+
+prare4 <- ggrarecurve(obj=rareres,
+                      factorNames="location",
+                      shadow=FALSE,
+                      indexNames=c("Observe")
+) +
+  scale_color_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"))+
+  theme_bw()+
+  theme(axis.text=element_text(size=8), panel.grid=element_blank(),
+        strip.background = element_rect(colour=NA,fill="grey"),
+        strip.text.x = element_text(face="bold"))+
+  ylim(0,2500)
+prare4
+```
+
+## Color coded by location: shortening x axis to 20,000 reads
+```{r}
+prare5 <- ggrarecurve(obj=rareres,
+                      factorNames="location",
+                      shadow=FALSE,
+                      indexNames=c("Observe")) +
+  scale_color_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"))+
+  theme_bw()+
+  theme(axis.text=element_text(size=8), panel.grid=element_blank(),
+        strip.background = element_rect(colour=NA,fill="grey"),
+        strip.text.x = element_text(face="bold"))+
+  xlim(0,20000)+
+  ylim(0,2500)
+prare5
+```
+
+## Color coded by location: shortening x axis to 5,000 reads
+```{r}
+prare5 <- ggrarecurve(obj=rareres,
+                      factorNames="location",
+                      shadow=FALSE,
+                      indexNames=c("Observe")) +
+  scale_color_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"))+
+  theme_bw()+
+  theme(axis.text=element_text(size=8), panel.grid=element_blank(),
+        strip.background = element_rect(colour=NA,fill="grey"),
+        strip.text.x = element_text(face="bold"))+
+  xlim(0,5000)+
+  ylim(0,2500)
+prare5
+```
+
+
+## Exlploring by location read depth more
+```{r}
+# exlploring by location read depth more
+prare1 <- ggrarecurve(obj=rareres, factorNames="location",
+                      indexNames=c("Observe")
+) +
+  scale_fill_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"))+
+  scale_color_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"))+
+  theme_bw()+
+  theme(axis.text=element_text(size=8), panel.grid=element_blank(),
+        strip.background = element_rect(colour=NA,fill="grey"),
+        strip.text.x = element_text(face="bold")) 
+prare1
+```
+
+# Create transformed datasets
+
+## Relative Abundance
+Normalize data on a proportional basis for further analysis (minus alpha diversity).
+```{r}
+norm_mock <-  transform_sample_counts(ps_final_analyze, function(x) x / sum(x) )
+save(norm_mock, file= "norm_mock.rds")
+norm_mock
+```
+
+
+## Rarefaction
+For alpha diversity analysis use data that has been normalized to a consistant size by rarefaction.
+```{r}
+set.seed(1234) #ensure results are the same 
+ps_rarefy <- rarefy_even_depth(ps_final_analyze, sample.size = min(sample_sums(ps_final_analyze)),
+                               rngseed = T, replace = TRUE, trimOTUs = TRUE, verbose = TRUE)
+sample_sums(ps_rarefy) 
+```
+
+# Plot heat map
+
+Based on a suggestion from [this phyloseq tutorial on Gitub](https://vaulot.github.io/tutorials/Phyloseq_tutorial.html#alpha-diversity), I'm going to make a heat map that only includes ASV's that are 20% of at least 1 or more sample
+
+I wonder if I could use this to find the core microbiome of specific groups?
+
+```{r}
+total = median(sample_sums(ps_final_analyze))
+forHeatMap <- filter_taxa(ps_final_analyze, function(x) sum(x > total*0.20) > 0, TRUE)
+forHeatMap
+plot_heatmap(forHeatMap, sample.label = "Sample_name", sample.order = "SampleID")
+```
+
+# Alpha Diversity
+
+## Plot Observed ASVs, Shannon Index, and Simpson Index
+
+### Factor by gender
+```{r}
+fist <- plot_richness(ps_rarefy, x="Gender", color="Herd", measures=c("Observed", "Shannon", "Simpson")) + 
+  labs(x = "Herd") +
+  scale_fill_manual(values=c("#e8ae66",  "#ae78de"))
+fist
+```
+
+### Factor by herd
+```{r}
+fist2 = plot_richness(ps_rarefy, x="Herd", color="Gender", measures=c("Observed", "Shannon", "Simpson")) + 
+  labs(x = "Gut Location") +
+  scale_fill_manual(values=c("#e8ae66",  "#ae78de"))
+fist2
+```
+
+
+### Factor by location
+```{r}
+fist2 = plot_richness(ps_rarefy, x="location", color="Herd", measures=c("Observed", "Shannon", "Simpson")) + 
+  labs(x = "Gut Location") +
+  scale_fill_manual(values=c("#e8ae66",  "#ae78de"))
+fist2
+```
+
+## Violin graphs of Observed ASVs, Shannon index, and Simpson Index
+Setup:
+```{r}
+#Calculations and different analysis of Alpha index
+library(MicrobiotaProcess)
+alphaobj <- get_alphaindex(ps_rarefy, .alpha = c("Observe"))
+head(as.data.frame(alphaobj))
+class(alphaobj)
+# KS: I'm removing ACE, Chao1, and Pielou metrics for graph readabiltiy
+alphaobj@alpha$Chao1 = NULL
+alphaobj@alpha$ACE = NULL
+alphaobj@alpha$Pielou = NULL 
+
+```
+
+### Factor by herd
+```{r}
+# note: number of colors must equal the number of variables!
+p_alphab <- ggbox(alphaobj, factorNames="Herd", geom="violin") +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))+
+  theme(strip.background = element_rect(colour=NA, fill="grey"))
+p_alphab
+```
+
+### Factor by gender
+```{r}
+p_alphab <- ggbox(alphaobj, geom="violin", factorNames="Gender") +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))+
+  theme(strip.background = element_rect(colour=NA, fill="grey"))
+p_alphab
+```
+
+### Factor by location
+```{r}
+p_alpha <- ggbox(alphaobj, geom="violin", factorNames="location") +
+  scale_fill_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"))+
+  theme(strip.background = element_rect(colour=NA, fill="grey"))
+p_alpha
+```
+
+
+## Alpha Diversity Statistics
+
+I'm going to asses alpha diversity using full data set in `ps_final_analyze`  
+Create a data frame with each samples number of observed ASVs.
+```{r}
+results3 = estimate_richness(ps_final_analyze, measures = c("Observed", "Shannon", "Simpson"))
+results_df3 <- as.data.frame(results3)
+head(results_df3)
+row.names(results_df3) = ps_final_analyze@sam_data$SampleID
+head(results_df3)
+results_df3$SampleID <- rownames(results_df3)
+results_df3 <- results_df3[c(4,1,2,3)]
+write.csv(results_df3, file = "observed_asv_rarfy.csv", row.names = TRUE)
+head(results_df3)
+```
+
+Merge that data frame with sample metadata
+```{r}
+alpha_mapping_file = Bison_meta
+# Have to fix the two replicates of PIF in bison 2
+alpha_mapping_file$location[13] = "PIF"
+alpha_mapping_file$location[14] = "PIF"
+# merge observed ASVs with sample metadata
+alpha_div_df3 <- merge(results_df3, alpha_mapping_file, by='SampleID')
+head(alpha_div_df3)
+```
+
+
+### By location
+
+Create a box plot of Observed ASVs at each location
+```{r}
+theme_set(theme_gray())
+p1 <- ggplot(alpha_div_df3, aes(x=location, y=Observed, fill=location)) + 
+  geom_boxplot()
+p2 <- p1 + scale_x_discrete(labels = c("DCF", "PCF", "PIF", "s1", "s2", "s3", "s4")) + 
+  theme(legend.position = "none", axis.text = element_text(size = 10), axis.title = element_text(size = 12)) + 
+  labs(x = "Gut Location", y = "Observed ASVs")
+p2
+
+# ggsave(plot = p2, filename = "obs_asv_gut_location.png",path = "E:\\Bison Project\\Bison_analysis_attempt_3\\figures", dpi = 300)
+```
+
+Create data sets by location
+```{r}
+dr = sample_data(ps_final_analyze)
+DCFr = results3[dr[,'location'] == 'DCF',]
+PCFr = results3[dr[,'location'] == 'PCF',]
+PIFr = results3[dr[,'location'] == 'PIF',]
+s1r = results3[dr[,'location'] == 's1',]
+s2r = results3[dr[,'location'] == 's3',]
+s3r = results3[dr[,'location'] == 's3',]
+s4r = results3[dr[,'location'] == 's4',]
+```
+
+Test for normal distribution
+```{r}
+shapDCF = shapiro.test(DCFr$Observed) 
+shapPCF = shapiro.test(PCFr$Observed) 
+shapPIF = shapiro.test(PIFr$Observed) 
+shaps1 = shapiro.test(s1r$Observed) 
+shaps2 = shapiro.test(s2r$Observed) 
+shaps3 = shapiro.test(s3r$Observed) 
+shaps4 = shapiro.test(s4r$Observed) 
+```
+
+Make a table of the Shapiro Test output
+```{r echo = FALSE}
+groups = c("DCF", "PCF", "PIF", "s1", "s2", "s3", "s4")
+shapvalue = c(shapDCF$statistic, shapPCF$statistic, shapPIF$statistic, shaps1$statistic, shaps2$statistic, shaps3$statistic, shaps4$statistic)
+shapvalue = round(shapvalue, digits = 2)
+shapP = c(shapDCF$p.value, shapPCF$p.value, shapPIF$p.value, shaps1$p.value, shaps2$p.value, shaps3$p.value, shaps4$p.value)
+shapP = round(shapP, digits = 2)
+
+table1 = data.frame(Group = groups, W = shapvalue,Pvalue = shapP)
+kable(table1, align = "ccc")
+
+```
+
+
+ANOVA  
+Because all the groups were normally distributed for observed ASVs I will use an ANOVA followed by pairwise t-tests.
+```{r}
+shann_krusk = kruskal.test(Observed ~ location, alpha_div_df3)
+shann_krusk
+
+dunn.test(x = alpha_div_df3$Observed, g = alpha_div_df3$location, method = "bh")
+```
+
+##### shannon index
+
+```{r}
+shapDCF = shapiro.test(DCFr$Shannon) 
+shapPCF = shapiro.test(PCFr$Shannon) 
+shapPIF = shapiro.test(PIFr$Shannon) 
+shaps1 = shapiro.test(s1r$Shannon) 
+shaps2 = shapiro.test(s2r$Shannon) 
+shaps3 = shapiro.test(s3r$Shannon) 
+shaps4 = shapiro.test(s4r$Shannon)
+
+shan_location_normality = tibble(location = c("DCF", "PCF", "PIF", "s1", "s2", "s3", "s4"),
+                                 p_value = c(shapDCF$p.value,
+                                             shapPCF$p.value,
+                                             shapPIF$p.value,
+                                             shaps1$p.value,
+                                             shaps2$p.value,
+                                             shaps3$p.value,
+                                             shaps4$p.value))
+shan_location_normality
+
+ggplot(data = alpha_div_df3)+
+  geom_boxplot(aes(x = location, y = Shannon, fill = location))+
+  scale_x_discrete(labels = c("DCF", "PCF", "PIF", "s1", "s2", "s3", "s4"))+
+  theme(legend.position = "none", 
+        axis.text = element_text(size = 10), 
+        axis.title = element_text(size = 12)) + 
+  labs(x = "Gut Location", 
+       y = "Shannon")
+```
+
+```{r}
+shann_krusk = kruskal.test(Shannon ~ location, alpha_div_df3)
+shann_krusk
+
+dunn.test(x = alpha_div_df3$Shannon, g = alpha_div_df3$location, method = "bh")
+```
+
+##### simpson index
+```{r}
+shapDCF = shapiro.test(DCFr$Simpson) 
+shapPCF = shapiro.test(PCFr$Simpson) 
+shapPIF = shapiro.test(PIFr$Simpson) 
+shaps1 = shapiro.test(s1r$Simpson) 
+shaps2 = shapiro.test(s2r$Simpson) 
+shaps3 = shapiro.test(s3r$Simpson) 
+shaps4 = shapiro.test(s4r$Simpson)
+
+sipmson_location_normality = tibble(location = c("DCF", "PCF", "PIF", "s1", "s2", "s3", "s4"),
+                                 p_value = c(shapDCF$p.value,
+                                             shapPCF$p.value,
+                                             shapPIF$p.value,
+                                             shaps1$p.value,
+                                             shaps2$p.value,
+                                             shaps3$p.value,
+                                             shaps4$p.value))
+sipmson_location_normality 
+
+ggplot(data = alpha_div_df3)+
+  geom_boxplot(aes(x = location, y = Simpson, fill = location))+
+  scale_x_discrete(labels = c("DCF", "PCF", "PIF", "s1", "s2", "s3", "s4"))+
+  theme(legend.position = "none", 
+        axis.text = element_text(size = 10), 
+        axis.title = element_text(size = 12)) + 
+  labs(x = "Gut Location", 
+       y = "Simpson")
+```
+
+```{r}
+shann_krusk = kruskal.test(Simpson ~ location, alpha_div_df3)
+shann_krusk
+
+dunn.test(x = alpha_div_df3$Simpson, g = alpha_div_df3$location, method = "bh")
+```
+
+
+### By gender
+Create a box plot of Observed ASVs for Males and Females
+```{r}
+theme_set(theme_gray())
+p1 <- ggplot(alpha_div_df3, aes(x=gender, y=Observed, fill=gender)) + 
+  geom_boxplot()
+p2 <- p1 + scale_x_discrete(labels = c("Female", "Male")) + 
+  theme(legend.position = "none", axis.text = element_text(size = 10), axis.title = element_text(size = 12)) + 
+  labs(x = "Sex", y = "Observed ASVs")
+p2
+
+# ggsave(plot = p2, filename = "obs_asv_sex.png",path = "E:\\Bison Project\\Bison_analysis_attempt_3\\figures", dpi = 300)
+```
+
+Create data sets by gender
+```{r}
+femaler = results3[dr[,'gender'] == 'f',]
+maler = results3[dr[,'gender'] == 'm',]
+```
+
+Test for normal distribution
+```{r}
+shapF = shapiro.test(femaler$Observed) 
+shapM = shapiro.test(maler$Observed) 
+```
+
+Make table of Shapiro test results
+```{r echo = FALSE}
+groups = c("Female", "Male")
+shapvalue = c(shapF$statistic, shapM$statistic)
+shapvalue = round(shapvalue, digits = 2)
+shapP = c(shapF$p.value, shapM$p.value)
+shapP = round(shapP, digits = 2)
+
+table1 = data.frame(Group = groups, W = shapvalue, Pvalue = shapP)
+kable(table1, align = "ccc")
+```
+
+Wilcoxon rank sum test
+```{r}
+wilcox.test(femaler$Observed,maler$Observed)
+```
+```{r}
+median(femaler$Observed)
+
+median(maler$Observed)
+```
+
+##### Shannon index
+```{r}
+shapF = shapiro.test(femaler$Shannon) 
+shapM = shapiro.test(maler$Shannon) 
+
+shannon_normality_by_sex = tibble(group = c("female", "male"),
+                                  p_value = c(shapF$p.value,
+                                              shapM$p.value))
+shannon_normality_by_sex 
+
+wilcox.test(femaler$Shannon,maler$Shannon)
+```
+
+##### Simpson index
+```{r}
+shapF = shapiro.test(femaler$Simpson) 
+shapM = shapiro.test(maler$Simpson) 
+
+simpson_normality_by_sex = tibble(group = c("female", "male"),
+                                  p_value = c(shapF$p.value,
+                                              shapM$p.value))
+simpson_normality_by_sex 
+
+wilcox.test(femaler$Simpson,maler$Simpson)
+```
+
+
+### By herd
+Create a box plot of Observed ASVs for the Cultural and Business herds
+```{r}
+theme_set(theme_gray())
+p1 <- ggplot(alpha_div_df3, aes(x=herd, y=Observed, fill=herd)) + 
+  geom_boxplot()
+p2 <- p1 + scale_x_discrete(labels = c("Business", "Cultural")) + 
+  theme(legend.position = "none", axis.text = element_text(size = 10), axis.title = element_text(size = 12)) + 
+  labs(x = "Herd", y = "Observed ASVs")
+p2
+
+# ggsave(plot = p2, filename = "obs_asv_herd.png",path = "E:\\Bison Project\\Bison_analysis_attempt_3\\figures", dpi = 300)
+```
+
+Create data sets by location
+```{r}
+bhr = results3[dr[,'herd'] == 'bh',]
+chr = results3[dr[,'herd'] == 'ch',]
+```
+
+Test for normal distribution
+```{r}
+shapbh = shapiro.test(bhr$Observed) 
+shapch = shapiro.test(chr$Observed) 
+```
+
+Make table of Shapiro test results
+```{r echo = FALSE}
+groups = c("Business", "Cultural")
+shapvalue = c(shapbh$statistic, shapch$statistic)
+shapvalue = round(shapvalue, digits = 2)
+shapP = c(shapbh$p.value, shapch$p.value)
+shapP = round(shapP, digits = 2)
+
+table1 = data.frame(Group = groups, W = shapvalue, Pvalue = shapP)
+kable(table1, align = "ccc")
+```
+
+Wilcoxon rank sum test
+```{r}
+wilcox.test(bhr$Observed,chr$Observed)
+```
+##### Shannon index
+```{r}
+  shapbh = shapiro.test(bhr$Shannon) 
+  shapch = shapiro.test(chr$Shannon) 
+  
+  shannon_normality_by_herd = tibble(group = c("Business", "Cultural"),
+                                    p_value = c(shapbh$p.value,
+                                                shapch$p.value))
+shannon_normality_by_herd 
+
+wilcox.test(bhr$Shannon,chr$Shannon)
+```
+##### Simpson Index
+```{r}
+shapbh = shapiro.test(bhr$Simpson) 
+shapch = shapiro.test(chr$Simpson) 
+  
+simpson_normality_by_sex = tibble(group = c("Business", "Cultural"),
+                                    p_value = c(shapbh$p.value,
+                                                shapch$p.value))
+simpson_normality_by_sex 
+
+wilcox.test(bhr$Shannon,chr$Shannon)
+```
+
+
+
+# Core microbiome
+Following Allsions 2021 paper on Bovine ocular bacterial communitys I'm going to try to find the core microbiome defining this as ASVs present in 80% or more of the samples.
+
+## Core Microbiome of all samples
+```{r}
+ps_final_analyze
+
+#with non normalized object
+core_microbiome = apply(X = otu_table(ps_final_analyze), 
+                       MARGIN = ifelse(taxa_are_rows(ps_final_analyze), yes = 1, no = 2), 
+                       FUN = function(x){sum(x > 0)})
+core_microbiome <- data.frame(Prevalence=core_microbiome, TotalAbundance=taxa_sums(ps_final_analyze))
+View(core_microbiome)
+
+# set percentage of samples an ASV must be in to be considered part of the core microbiome. Multiply this percentage times the number of samples to get the cutoff number of samples.
+percentage = dim(ps_final_analyze@otu_table)[1] * 0.80
+percentage
+core_ps_analyze <- rownames(core_microbiome)[core_microbiome$Prevalence >=percentage ]
+core_ps_analyze
+
+#main core ASVs filtering from normalized data set
+name_run <- taxa_names(norm_mock)
+name_run_1 <- name_run[(name_run %in% core_ps_analyze)]
+
+core_1 <- prune_taxa(name_run_1, norm_mock)
+core_1
+
+taxa_names(core_1)
+sum(otu_table(core_1))/sum(otu_table(norm_mock)) 
+
+save(core_1, file = "core_entire_set.rds")
+#load("core_entire_set.rds")
+
+write.table(otu_table(core_1), "core_1.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+write.csv(core_1@tax_table, "core_1_taxa.csv", row.names = TRUE)
+
+unique(core_1@tax_table[,2])
+unique(core_1@tax_table[,6])
+```
+
+## Core microbiome of foregut samples
+```{r}
+# create subset with only foregut samples
+foregut = subset_samples(ps_final_analyze, location != "DCF")
+foregut = subset_samples(foregut, location != "PCF")
+foregut = subset_samples(foregut, location != "PIF")
+
+# Check to make sure only correct samples remain
+sample_data(foregut)$location
+
+
+#with non normalized object
+foregut_core_microbiome = apply(X = otu_table(foregut), 
+                       MARGIN = ifelse(taxa_are_rows(foregut), yes = 1, no = 2), 
+                       FUN = function(x){sum(x > 0)})
+foregut_core_microbiome <- data.frame(Prevalence=foregut_core_microbiome, TotalAbundance=taxa_sums(foregut))
+
+# set percentage of samples an ASV must be in to be considered part of the core microbiome. Multiply this percentage times the number of samples to get the cutoff number of samples.
+percentage = dim(foregut@otu_table)[1] * 0.80
+percentage
+core_foregut <- rownames(foregut_core_microbiome)[foregut_core_microbiome$Prevalence >=percentage ]
+core_foregut
+
+
+#main core ASVs filtering from normalized data set
+name_run <- taxa_names(norm_mock)
+name_run_1 <- name_run[(name_run %in% core_foregut)]
+
+core_1 <- prune_taxa(name_run_1, foregut)
+core_1
+
+taxa_names(core_1)
+sum(otu_table(core_1))/sum(otu_table(foregut)) ###54.7% of total reads in foregut
+
+save(core_1, file = "core_foregut.rds")
+#load("core_foregut.rds")
+
+write.table(otu_table(core_1), "core_foregut.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+write.csv(core_1@tax_table, "core_foregut_taxa.csv", row.names = TRUE)
+
+unique(core_1@tax_table[,2])
+unique(core_1@tax_table[,6])
+```
+
+## Core microbiome of hindgut samples
+```{r}
+# create subset with only hindgut samples
+hindgut = subset_samples(ps_final_analyze, location != "s1")
+hindgut = subset_samples(hindgut, location != "s2")
+hindgut = subset_samples(hindgut, location != "s3")
+hindgut = subset_samples(hindgut, location != "s4")
+
+# Check to make sure only correct samples remain
+sample_data(hindgut)$location
+hindgut
+
+#with non normalized object
+hindgut_core_microbiome = apply(X = otu_table(hindgut), 
+                       MARGIN = ifelse(taxa_are_rows(hindgut), yes = 1, no = 2), 
+                       FUN = function(x){sum(x > 0)})
+hindgut_core_microbiome <- data.frame(Prevalence=hindgut_core_microbiome, TotalAbundance=taxa_sums(hindgut))
+
+# set percentage of samples an ASV must be in to be considered part of the core microbiome. Multiply this percentage times the number of samples to get the cutoff number of samples.
+percentage = dim(hindgut@otu_table)[1] * 0.80
+percentage
+core_hindgut <- rownames(hindgut_core_microbiome)[hindgut_core_microbiome$Prevalence >=percentage ]
+core_hindgut
+
+#main core ASVs filtering from normalized data set
+name_run <- taxa_names(norm_mock)
+name_run_1 <- name_run[(name_run %in% core_hindgut)]
+
+core_1 <- prune_taxa(name_run_1, hindgut)
+core_1
+
+taxa_names(core_1)
+sum(otu_table(core_1))/sum(otu_table(hindgut)) ###23.4% of total reads in foregut
+
+save(core_1, file = "core_hindgut.rds")
+#load("core_hindgut.rds")
+
+write.table(otu_table(core_1), "core_hindgut.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+write.csv(core_1@tax_table, "hindgut_core_tax_tab.csv")
+
+unique(core_1@tax_table[,2])
+unique(core_1@tax_table[,6])
+```
+
+
+# Beta Diversity
+
+## PCA ordination
+
+If the input was normalized, the method parameter should be setted NULL.
+```{r}
+pcares <- get_pca(obj=norm_mock, method="hellinger")
+```
+
+
+### Color coded by gender
+
+```{r}
+pcaplot1 <- ggordpoint(obj=pcares, biplot=TRUE, speciesannot=TRUE,
+                       factorNames=c("Gender"), ellipse=TRUE) +
+  scale_color_manual(values=c("#00AED7", "#FD9347")) +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))
+# pc = c(1, 3) to show the first and third principal components.
+pcaplot2 <- ggordpoint(obj=pcares, pc=c(1, 3), biplot=TRUE, speciesannot=TRUE,
+                       factorNames=c("Gender"), ellipse=TRUE) +
+  scale_color_manual(values=c("#00AED7", "#FD9347")) +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))
+pca200 <- pcaplot1 | pcaplot2
+pca200
+```
+
+
+### Color coded by herd
+
+```{r}
+pcaplot1 <- ggordpoint(obj=pcares, biplot=TRUE, speciesannot=TRUE,
+                       factorNames=c("Herd"), ellipse=TRUE) +
+  scale_color_manual(values=c("#00AED7", "#FD9347")) +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))
+# pc = c(1, 3) to show the first and third principal components.
+pcaplot2 <- ggordpoint(obj=pcares, pc=c(1, 3), biplot=TRUE, speciesannot=TRUE,
+                       factorNames=c("Herd"), ellipse=TRUE) +
+  scale_color_manual(values=c("#00AED7", "#FD9347")) +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))
+pca3 <- pcaplot1 | pcaplot2
+pca3
+```
+
+
+### Color coded by location
+
+```{r}
+pcaplot1 <- ggordpoint(obj=pcares, biplot=TRUE, speciesannot=TRUE,
+                       factorNames=c("Herd"), ellipse=TRUE) +
+  scale_color_manual(values=c("#00AED7", "#FD9347")) +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))
+# pc = c(1, 3) to show the first and third principal components.
+pcaplot2 <- ggordpoint(obj=pcares, pc=c(1, 3), biplot=TRUE, speciesannot=TRUE,
+                       factorNames=c("Herd"), ellipse=TRUE) +
+  scale_color_manual(values=c("#00AED7", "#FD9347")) +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))
+pca3 <- pcaplot1 | pcaplot2
+pca3
+```
+
+
+## PCoA ORDINATION
+
+I am using Bray-curtis distances as the distance method. 
+```{r}
+pcoares <- get_pcoa(obj=norm_mock, distmethod="bray", method="hellinger")
+```
+
+
+### Color coded by Herd
+
+```{r}
+pcoaplot1 <- ggordpoint(obj=pcoares, biplot=TRUE, speciesannot=TRUE,
+                        factorNames=c("Herd"), ellipse=TRUE) +
+  scale_color_manual(values=c("#00AED7", "#FD9347")) +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))
+# first and third principal co-ordinates
+pcoaplot2 <- ggordpoint(obj=pcoares, pc=c(1, 3), biplot=TRUE, speciesannot=TRUE,
+                        factorNames=c("Herd"), ellipse=TRUE) +
+  scale_color_manual(values=c("#00AED7", "#FD9347")) +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))
+pcoa <- pcoaplot1 | pcoaplot2
+pcoa
+```
+ 
+### Color coded by Gender
+ 
+```{r}
+pcoaplot1 <- ggordpoint(obj=pcoares, biplot=TRUE, speciesannot=TRUE,
+                        factorNames=c("Gender"), ellipse=TRUE) +
+  scale_color_manual(values=c("#00AED7", "#FD9347")) +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))
+# first and third principal co-ordinates
+pcoaplot2 <- ggordpoint(obj=pcoares, pc=c(1, 3), biplot=TRUE, speciesannot=TRUE,
+                        factorNames=c("Gender"), ellipse=TRUE) +
+  scale_color_manual(values=c("#00AED7", "#FD9347")) +
+  scale_fill_manual(values=c("#00AED7", "#FD9347"))
+pcoa1 <- pcoaplot1 | pcoaplot2
+pcoa1
+```
+ 
+### Color coded by Location
+ 
+```{r}
+pcoaplot1 <- ggordpoint(obj=pcoares, biplot=TRUE, speciesannot=TRUE,
+                        factorNames=c("location"), ellipse=TRUE) +
+  scale_color_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882")) +
+  scale_fill_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"))+
+  theme(legend.position = "none",
+        plot.title = element_blank())
+# first and third principal co-ordinates
+pcoaplot2 <- ggordpoint(obj=pcoares, pc=c(1, 3), biplot=TRUE, speciesannot=TRUE,
+                        factorNames=c("location"), ellipse=TRUE) +
+  scale_color_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882")) +
+  scale_fill_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"))+
+  theme(plot.title = element_blank())
+pcoa3 <- pcoaplot1 | pcoaplot2
+pcoa3
+
+# ggsave(plot = pcoa3,
+#        filename = "pcoa_location.png",
+#        path = "E:\\Bison Project\\Bison_analysis_attempt_3\\figures",
+#        dpi = 300)
+```
+ 
+## PERMANOVA: Permutational Multivariate Analysis of Variance
+ 
+ This test gives slightly different results depending on the order variables are inputed. Because of that, I'm going to run the test 6 times to test every order of variables
+ 
+```{r}
+distme <- get_dist(norm_mock, distmethod ="bray", method="hellinger")
+# Interensting: the order of IV's affects the result and it seems that all three variables are significant??
+# Order = gender, location, herd
+sampleda <- data.frame(sample_data(norm_mock), check.names=FALSE)
+sampleda <- sampleda[match(colnames(as.matrix(distme)),rownames(sampleda)),,drop=FALSE]
+sampleda$Herd <- factor(sampleda$Herd)
+sampleda$Gender = factor(sampleda$Gender)
+sampleda$location = factor(sampleda$location)
+set.seed(1024)
+
+
+# order = location + Gender + Herd
+adores = adonis(distme ~ location + Gender + Herd, data=sampleda, permutation=9999)
+adores = data.frame(adores$aov.tab)
+adores
+
+```
+ 
+```{r}
+# Create Function to do Pairwise tests
+
+pairwise_adonis = function(ps, vari, g1, g2, seed = 1024){
+  # set seed
+  set.seed(seed)
+  
+  # make phyloseq subset
+  sample_sub = prune_samples((ps@sam_data[[vari]] == g1 | ps@sam_data[[vari]] == g2), ps)
+  sample_sub = phyloseq::prune_taxa(phyloseq::taxa_sums(sample_sub) > 0, sample_sub)
+  
+  # get distance matrix
+  dist = MicrobiotaProcess::get_dist(sample_sub, distmethod ="bray", method="hellinger")
+  
+  # make sample data frame
+  sample_dat = data.frame(phyloseq::sample_data(sample_sub), check.names=FALSE)
+  sample_dat = sample_dat[match(colnames(as.matrix(dist)),rownames(sample_dat)),,drop=FALSE]
+  
+  # do PERMANOVA
+  model_call <- as.formula(paste0("dist~",vari))
+  permanova = vegan::adonis2(model_call, data = sample_dat, permutations = 9999)
+  
+  # do BETADISPER
+  dispersion_test = vegan::betadisper(d = dist, group = sample_dat[[vari]])
+  
+  # output
+  output = list(sample_data = as.data.frame(sample_sub@sam_data),
+                model_call = paste0("dist~",vari),
+                permanova = permanova,
+                betadisper = dispersion_test)
+  return(output)
+}
+```
+
+pairwise permanova tests by
+```{r}
+DCF_PCF_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "DCF",
+                                g2 = "PCF")
+DCF_PCF_test$permanova
+
+
+DCF_PIF_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "DCF",
+                                g2 = "PIF")
+DCF_PIF_test$permanova
+
+DCF_s1_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "DCF",
+                                g2 = "s1")
+DCF_s1_test$permanova
+
+DCF_s2_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "DCF",
+                                g2 = "s2")
+DCF_s2_test$permanova
+
+DCF_s3_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "DCF",
+                                g2 = "s3")
+DCF_s3_test$permanova
+
+DCF_s4_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "DCF",
+                                g2 = "s4")
+DCF_s4_test$permanova
+
+PCF_PIF_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "PCF",
+                                g2 = "PIF")
+PCF_PIF_test$permanova
+
+PCF_s1_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "PCF",
+                                g2 = "s1")
+PCF_s1_test$permanova
+
+PCF_s2_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "PCF",
+                                g2 = "s2")
+PCF_s2_test$permanova
+
+PCF_s3_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "PCF",
+                                g2 = "s3")
+PCF_s3_test$permanova
+
+PCF_s4_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "PCF",
+                                g2 = "s4")
+PCF_s4_test$permanova
+
+PIF_s1_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "PIF",
+                                g2 = "s1")
+PIF_s1_test$permanova
+
+PIF_s2_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "PIF",
+                                g2 = "s2")
+PIF_s2_test$permanova
+
+PIF_s3_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "PIF",
+                                g2 = "s3")
+PIF_s3_test$permanova
+
+PIF_s4_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "PIF",
+                                g2 = "s4")
+PIF_s4_test$permanova
+
+s1_s2_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "s1",
+                                g2 = "s2")
+s1_s2_test$permanova
+
+s1_s3_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "s1",
+                                g2 = "s3")
+s1_s3_test$permanova
+
+s1_s4_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "s1",
+                                g2 = "s4")
+s1_s4_test$permanova
+
+s2_s3_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "s2",
+                                g2 = "s3")
+s2_s3_test$permanova
+
+s2_s4_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "s2",
+                                g2 = "s4")
+s2_s4_test$permanova
+
+s3_s4_test = pairwise_adonis(ps = norm_mock, 
+                                vari = "location",
+                                g1 = "s3",
+                                g2 = "s4")
+s3_s4_test$permanova
+
+# Adjust p-values and make table.
+permanova_pairwise = tibble(comparison = c("DCF - PCF",
+                                           "DCF - PIF",
+                                           "DCF - s1",
+                                           "DCF - s2",
+                                           "DCF - s3",
+                                           "DCF - s4",
+                                           "PCF - PIF",
+                                           "PCF - s1",
+                                           "PCF - s2",
+                                           "PCF - s3",
+                                           "PCF - s4",
+                                           "PIF - s1",
+                                           "PIF - s2",
+                                           "PIF - s3",
+                                           "PIF - s4",
+                                           "s1 - s2",
+                                           "s1 - s3",
+                                           "s1 - s4",
+                                           "s2 - s3",
+                                           "s2 - s4",
+                                           "s3 - s4"),
+                            R2 = c(DCF_PCF_test$permanova$R2[1],
+                                  DCF_PIF_test$permanova$R2[1],
+                                  DCF_s1_test$permanova$R2[1],
+                                  DCF_s2_test$permanova$R2[1],
+                                  DCF_s3_test$permanova$R2[1],
+                                  DCF_s4_test$permanova$R2[1],
+                                  PCF_PIF_test$permanova$R2[1],
+                                  PCF_s1_test$permanova$R2[1],
+                                  PCF_s2_test$permanova$R2[1],
+                                  PCF_s3_test$permanova$R2[1],
+                                  PCF_s4_test$permanova$R2[1],
+                                  PIF_s1_test$permanova$R2[1],
+                                  PIF_s2_test$permanova$R2[1],
+                                  PIF_s3_test$permanova$R2[1],
+                                  PIF_s4_test$permanova$R2[1],
+                                  s1_s2_test$permanova$R2[1],
+                                  s1_s3_test$permanova$R2[1],
+                                  s1_s4_test$permanova$R2[1],
+                                  s2_s3_test$permanova$R2[1],
+                                  s2_s4_test$permanova$R2[1],
+                                  s3_s4_test$permanova$R2[1]),
+                            p = c(DCF_PCF_test$permanova$`Pr(>F)`[1],
+                                  DCF_PIF_test$permanova$`Pr(>F)`[1],
+                                  DCF_s1_test$permanova$`Pr(>F)`[1],
+                                  DCF_s2_test$permanova$`Pr(>F)`[1],
+                                  DCF_s3_test$permanova$`Pr(>F)`[1],
+                                  DCF_s4_test$permanova$`Pr(>F)`[1],
+                                  PCF_PIF_test$permanova$`Pr(>F)`[1],
+                                  PCF_s1_test$permanova$`Pr(>F)`[1],
+                                  PCF_s2_test$permanova$`Pr(>F)`[1],
+                                  PCF_s3_test$permanova$`Pr(>F)`[1],
+                                  PCF_s4_test$permanova$`Pr(>F)`[1],
+                                  PIF_s1_test$permanova$`Pr(>F)`[1],
+                                  PIF_s2_test$permanova$`Pr(>F)`[1],
+                                  PIF_s3_test$permanova$`Pr(>F)`[1],
+                                  PIF_s4_test$permanova$`Pr(>F)`[1],
+                                  s1_s2_test$permanova$`Pr(>F)`[1],
+                                  s1_s3_test$permanova$`Pr(>F)`[1],
+                                  s1_s4_test$permanova$`Pr(>F)`[1],
+                                  s2_s3_test$permanova$`Pr(>F)`[1],
+                                  s2_s4_test$permanova$`Pr(>F)`[1],
+                                  s3_s4_test$permanova$`Pr(>F)`[1]))
+permanova_pairwise |> 
+  mutate(p_adj = p.adjust(p, method = "BH")) -> permanova_pairwise
+print(permanova_pairwise)
+```
+ 
+ 
+# Hierarchial cluster analysis of samples
+
+```{r message = FALSE}
+library(ggplot2)
+library(MicrobiotaProcess)
+library(ggtree)
+```
+
+```{r}
+hcsample <- get_clust(obj=norm_mock, distmethod="bray",
+                      method="hellinger", hclustmethod="average")
+# rectangular layout
+cplot1 <- ggclust(obj=hcsample,
+                  layout = "rectangular",
+                  pointsize=1,
+                  fontsize=0,
+                  factorNames=c("location")
+) +
+  scale_color_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882")) +
+  theme_tree2(legend.position="right",
+              plot.title = element_text(face="bold", lineheight=25,hjust=0.5))
+# circular layout
+cplot2 <- ggclust(obj=hcsample,
+                  layout = "circular",
+                  pointsize=1,
+                  fontsize=2,
+                  factorNames=c("location"),
+) +
+  scale_color_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882")) +
+  theme(legend.position="right")
+#Hierar <- cplot1 | cplot2 
+cplot1 
+cplot2
+```
+
+# Biomarker Discovery
+
+```{r message = FALSE}
+# for the kruskal_test and wilcox_test
+library(coin)
+library(MicrobiotaProcess)
+```
+
+Since the effect size is calculated by randomly re-sampling, the seed should be set for reproducible results. For help understanding the details go to [this MicrobiotalProcess reference](https://bioconductor.riken.jp/packages/3.12/bioc/vignettes/MicrobiotaProcess/inst/doc/MicrobiotaProcess-biomaker-discovery.html). 
+
+```{r}
+set.seed(1024)
+deres <- diff_analysis(obj = norm_mock, classgroup = "location",
+                       mlfun = "lda",
+                       filtermod = "pvalue",
+                       firstcomfun = "kruskal_test",
+                       firstalpha = 0.05,
+                       strictmod = TRUE,
+                       secondcomfun = "wilcox_test",
+                       subclmin = 3,
+                       subclwilc = TRUE,
+                       secondalpha = 0.01,
+                       lda=3)
+deres
+```
+
+
+Only 4 levels of location have biomarkers in this data set (DCR, PCF, PIF, and s4). 64 discriminating ASVs were found but only 43 have certain taxonomy and will be represented in the figures to follow.
+
+```{r}
+# BIOMARKER TAXA GROUPED BY THEIR LOCATION AND LDA SCORES SHOWN
+plotes <- ggeffectsize(obj=deres) + 
+  scale_color_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"))
+plotes
+# PHYLOGENETIC TREE HIGHLIGHTING BIOMARKER TAXA
+diffclade_p <- ggdiffclade(
+  obj=deres, 
+  alpha=0.3, 
+  linewd=0.15,
+  skpointsize=0.6, 
+  layout="radial",
+  taxlevel=3, 
+  removeUnkown=TRUE,
+  reduce=TRUE # This argument is to remove the branch of unknown taxonomy.
+) +
+  scale_fill_manual(
+    values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882")
+  ) +
+  guides(color = guide_legend(
+    keywidth = 0.1, 
+    keyheight = 0.6,
+    order = 3,
+    ncol=1)
+  ) +
+  theme(
+    panel.background=element_rect(fill=NA),
+    legend.position="right", 
+    plot.margin=margin(0,0,0,0),
+    legend.spacing.y=unit(0.02, "cm"), 
+    legend.title=element_text(size=7),
+    legend.text=element_text(size=6), 
+    legend.box.spacing=unit(0.02,"cm")
+  )
+diffclade_p
+# GGDIFFBOX FIGURE: SHOWS RELATIVE ABUND FOR EACH LOCATION AND LDA SCORE OF EACH BIOMAKER
+# creates an interesting visual but its just too cluttered. You cant see the relative abundance boxplots
+diffbox <- ggdiffbox(obj=deres, box_notch=FALSE, 
+                     colorlist=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"), 
+                     l_xlabtext="relative abundance", 
+                     addLDA = TRUE, 
+                     dodge_width = 2)
+diffbox
+```
+
+I like to split the biomarkers into two gropus to visualize so that the figures are less cluttered
+
+```{r}
+# TRYING TO FIND A WAY TO SPLIT GRAPHICS BASED ON GROUPINGS OF PIF AND EVERYTHING ELSE
+isPIF = deres@result[["location"]] %in% "PIF"
+isPIF # a vector that is false for DCF, PCF, and s4 biomarkers and true for PIF biomarkers
+class(deres)
+# THIS IS MY CODE TO PLAY WITH DIFFBOX TRYING TO MAKE ggdiffbox() MORE READABLE
+# PIPED THE RESULT OF diff_analysis (with the added argument "action = "get"") into a
+# filter function to keep only the taxa for isPIF == TRUE. 
+set.seed(1024)
+deresPIF <- diff_analysis(obj = norm_mock, classgroup = "location", action = "get",
+                          mlfun = "lda",
+                          filtermod = "pvalue",
+                          firstcomfun = "kruskal_test",
+                          firstalpha = 0.05,
+                          strictmod = TRUE,
+                          secondcomfun = "wilcox_test",
+                          subclmin = 3,
+                          subclwilc = TRUE,
+                          secondalpha = 0.01,
+                          lda=3) %>% dplyr::filter(isPIF == TRUE)
+deresPIF
+set.seed(1024)
+deresElse = diff_analysis(obj = norm_mock, classgroup = "location", action = "get",
+                          mlfun = "lda",
+                          filtermod = "pvalue",
+                          firstcomfun = "kruskal_test",
+                          firstalpha = 0.05,
+                          strictmod = TRUE,
+                          secondcomfun = "wilcox_test",
+                          subclmin = 3,
+                          subclwilc = TRUE,
+                          secondalpha = 0.01,
+                          lda=3) %>% dplyr::filter(isPIF == FALSE)
+deresElse
+```
+
+Now I can make less cluttered graphics
+
+```{r}
+# plot PIF biomarkers using ggdiffbox
+diffbox <- ggdiffbox(obj=deresPIF, box_notch=FALSE, 
+                     colorlist=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"), 
+                     l_xlabtext="relative abundance", 
+                     addLDA = TRUE,
+                     box_width= .05,)
+diffbox
+# plot DCF, PCF, and s4 biomarkers using ggdiffbox
+diffbox <- ggdiffbox(obj=deresElse, box_notch=FALSE, 
+                     colorlist=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"), 
+                     l_xlabtext="relative abundance", 
+                     addLDA = TRUE,
+                     box_width= .05,)
+diffbox
+```
+
+# Correlation of Taxonomy
+`{r message = FALSE}
+library("WGCNA")
+library("preprocessCore")
+library("impute")
+# library("Go.db")
+library("reshape")
+`
+
+`{r}
+genustab <- get_taxadf(ps_final_analyze, taxlevel=6)
+genustab <- data.frame(t(otu_table(genustab)), check.names=FALSE)
+genustab <- data.frame(apply(genustab, 2, function(x)x/sum(x)), check.names=FALSE)
+
+cortest <- WGCNA::corAndPvalue(genustab, method="spearman", alternative="two.sided")
+cortest$cor[upper.tri(cortest$cor, diag = TRUE)] <- NA
+cortest$p[upper.tri(cortest$p, diag = TRUE)] <- NA
+
+cortab1 <- na.omit(melt(t(cortest$cor))) %>% rename(from=Var1,to=Var2,cor=value)
+corptab1 <- na.omit(melt(t(cortest$p))) %>% rename(pvalue=value)
+cortab1$fdr <- p.adjust(corptab1$pvalue, method="fdr")
+
+cortab1 <- cortab1 %>% mutate(correlation=case_when(cor>0 ~ "positive",cor < 0 ~ "negative",TRUE ~ "No"))
+cortab2 <- cortab1 %>% filter(fdr <= 0.05) %>% filter(cor <= -0.5 | cor >= 0.8)
+
+p <- ggdiffclade(
+  obj=deres,
+  alpha=0.3,
+  linewd=0.25,
+  skpointsize=0.2,
+  layout="rectangular",
+  taxlevel=7,
+  cladetext=0,
+  setColors=FALSE,
+  xlim=16
+) +
+  scale_fill_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"),
+                    guide=guide_legend(keywidth=0.5,
+                                       keyheight=0.5,
+                                       order=3,
+                                       override.aes=list(alpha=1))
+  ) +
+  scale_size_continuous(range=c(1, 3),
+                        guide=guide_legend(keywidth=0.5,keyheight=0.5,order=4,
+                                           override.aes=list(shape=21))) +
+  scale_colour_manual(values=rep("white", 100),guide="none")
+
+p2 <- p +
+  new_scale_color() +
+  new_scale("size") +
+  geom_tiplab(size=1, hjust=1) +
+  geom_taxalink(
+    data=cortab2,
+    mapping=aes(taxa1=from,
+                taxa2=to,
+                colour=correlation,
+                size=abs(cor)),
+    alpha=0.4,
+    ncp=10,
+    hratio=1,
+    offset=1.2
+  ) +
+  scale_size_continuous(range = c(0.2, 1),
+                        guide=guide_legend(keywidth=1, keyheight=0.5,
+                                           order=1, override.aes=list(alpha=1))
+  ) +
+  scale_colour_manual(values=c("#e8ae66", "#b8de78", "#78dec8", "#78a3de", "#ae78de", "#de78de", "#de7882"),
+                      guide=guide_legend(keywidth=0.5, keyheight=0.5,
+                                         order=2, override.aes=list(alpha=1, size=1)))
+p2
+
+`
+
+
+
+
+# Session Inforation
+
+```{r}
+sessionInfo()
+```
+
+
+
+
